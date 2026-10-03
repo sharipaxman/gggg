@@ -1,6 +1,7 @@
 """
-Разовая настройка: скачивает модель Whisper и языковой пакет Argos Translate
-(en->ru) на локальный диск, чтобы дальше приложение работало полностью офлайн.
+Разовая настройка: готовит модель Silero VAD, модель Whisper и языковой пакет
+Argos Translate (en->ru) на локальном диске, чтобы дальше приложение работало
+полностью офлайн.
 
 Запуск:  python scripts/setup_models.py
 Интернет нужен только для этого разового запуска.
@@ -15,6 +16,36 @@ from app.config import WHISPER_MODEL_SIZE, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE,
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def setup_silero_vad():
+    """Готовит детектор речи Silero VAD и прогревает его одним прогоном.
+
+    Если установлен pip-пакет `silero-vad`, модель (~1 МБ) уже лежит внутри
+    пакета и интернет не нужен совсем. Иначе модель один раз скачается через
+    torch.hub в data/models/torch_hub.
+    """
+    logger.info("Подготовка Silero VAD...")
+    import numpy as np
+    import torch
+
+    from app.config import SAMPLE_RATE, VAD_WINDOW_SAMPLES
+    from app.vad_segmenter import load_silero_model
+
+    model = load_silero_model()
+
+    # прогрев: один прогон тишины, чтобы убедиться, что модель реально работает
+    silence = torch.zeros(VAD_WINDOW_SAMPLES, dtype=torch.float32)
+    with torch.no_grad():
+        probability = float(model(silence, SAMPLE_RATE).item())
+    if hasattr(model, "reset_states"):
+        model.reset_states()
+
+    logger.info(
+        "Silero VAD готов (окно %d сэмплов, вероятность речи на тишине %.4f)",
+        VAD_WINDOW_SAMPLES,
+        probability,
+    )
 
 
 def setup_whisper():
@@ -56,6 +87,7 @@ def setup_argos_translate():
 
 
 if __name__ == "__main__":
+    setup_silero_vad()
     setup_whisper()
     setup_argos_translate()
     logger.info("Готово. Теперь приложение может работать полностью офлайн.")

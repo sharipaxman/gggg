@@ -22,6 +22,7 @@ from app.config import SAMPLE_RATE, FRAME_MS
 
 logger = logging.getLogger(__name__)
 
+# 512 сэмплов (32 мс при 16 кГц) — размер окна, который принимает Silero VAD
 FRAME_SAMPLES = int(SAMPLE_RATE * FRAME_MS / 1000)
 
 
