@@ -22,7 +22,10 @@ VAD-сегментатор на Silero VAD: главная логика "дож�
 4. Как только подряд набирается END_OF_SPEECH_SILENCE_MS тишины —
    считаем, что фраза закончена, и отдаём накопленный буфер целиком
    на распознавание. Это и есть требование "не по три слова, а когда
-   человек реально закончил говорить".
+   человек реально закончил говорить". Порог 1200 мс: паузы "подумать"
+   внутри предложения (обычно до секунды) не должны разрывать фразу.
+   Тихий хвост в конце (POST_SPEECH_PADDING_MS) сохраняем в фразе —
+   чтобы не отрезать окончания последних слов.
 5. Короткие случайные всплески (вдох, щелчок) короче MIN_UTTERANCE_MS
    отбрасываются и не считаются фразой.
 6. Если человек говорит очень долго без пауз (MAX_UTTERANCE_MS) —
@@ -56,6 +59,7 @@ from app.config import (
     MIN_UTTERANCE_MS,
     MAX_UTTERANCE_MS,
     PRE_SPEECH_PADDING_MS,
+    POST_SPEECH_PADDING_MS,
 )
 
 logger = logging.getLogger(__name__)
@@ -143,6 +147,7 @@ class VadSegmenter:
         self._min_speech_frames = max(1, int(MIN_UTTERANCE_MS / FRAME_MS))
         self._max_speech_frames = max(1, int(MAX_UTTERANCE_MS / FRAME_MS))
         self._pre_pad_frames = max(0, int(PRE_SPEECH_PADDING_MS / FRAME_MS))
+        self._post_pad_frames = max(0, int(POST_SPEECH_PADDING_MS / FRAME_MS))
 
         self._ring_buffer: list[np.ndarray] = []   # кольцевой буфер "до начала речи"
         self._speech_buffer: list[np.ndarray] = []
@@ -268,15 +273,18 @@ class VadSegmenter:
             self._finalize_utterance(forced=reached_max_len and not reached_silence_end)
 
     def _finalize_utterance(self, forced: bool = False):
-        # Отрезаем хвост тишины, который использовался только для ДЕТЕКЦИИ конца фразы —
-        # иначе длительность фразы искусственно "раздувается" на END_OF_SPEECH_SILENCE_MS
-        # и короткие шумовые всплески ошибочно проходят порог MIN_UTTERANCE_MS.
-        trimmed_buffer = self._speech_buffer
-        if not forced and self._silence_run > 0:
-            trimmed_buffer = self._speech_buffer[:-self._silence_run] or self._speech_buffer
+        # Сколько кадров в буфере — реальная речь (предзапись + сама речь),
+        # без хвоста тишины, который копился только для ДЕТЕКЦИИ конца фразы.
+        speech_frames = max(0, len(self._speech_buffer) - self._silence_run)
 
-        total_frames = len(trimmed_buffer)
-        if total_frames >= self._min_speech_frames:
+        if speech_frames >= self._min_speech_frames:
+            # Хвост тишины отрезаем, но оставляем POST_SPEECH_PADDING_MS:
+            # тихие окончания последних слов VAD помечает как тишину, и если
+            # отрезать её целиком, Whisper теряет конец предложения.
+            keep_tail = 0 if forced else min(self._silence_run, self._post_pad_frames)
+            trimmed_buffer = self._speech_buffer[:speech_frames + keep_tail]
+
+            total_frames = len(trimmed_buffer)
             pcm = np.concatenate(trimmed_buffer)
             duration_ms = int(total_frames * FRAME_MS)
             reason = "максимальная длина (речь без пауз)" if forced else "обнаружена пауза — конец фразы"
@@ -286,7 +294,7 @@ class VadSegmenter:
             except Exception:
                 logger.exception("Ошибка в обработчике готовой фразы")
         else:
-            logger.debug("Отброшен короткий всплеск (%d мс) — не фраза", total_frames * FRAME_MS)
+            logger.debug("Отброшен короткий всплеск (%d мс) — не фраза", speech_frames * FRAME_MS)
 
         self._in_speech = False
         self._speech_buffer = []

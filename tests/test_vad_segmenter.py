@@ -26,12 +26,14 @@ from app.config import (  # noqa: E402
     END_OF_SPEECH_SILENCE_MS,
     MIN_UTTERANCE_MS,
     MAX_UTTERANCE_MS,
+    POST_SPEECH_PADDING_MS,
 )
 from app.vad_segmenter import VadSegmenter, Utterance  # noqa: E402
 
 SILENCE_FRAMES = max(1, int(END_OF_SPEECH_SILENCE_MS / FRAME_MS))
 MIN_SPEECH_FRAMES = max(1, int(MIN_UTTERANCE_MS / FRAME_MS))
 MAX_SPEECH_FRAMES = max(1, int(MAX_UTTERANCE_MS / FRAME_MS))
+POST_PAD_FRAMES = max(0, int(POST_SPEECH_PADDING_MS / FRAME_MS))
 
 
 class LoudnessModel:
@@ -110,9 +112,51 @@ class VadSegmenterTestCase(unittest.TestCase):
         self.assertEqual(len(self.utterances), 1)
 
         utterance = self.utterances[0]
-        self.assertEqual(utterance.duration_ms, speech_frames * FRAME_MS)
-        self.assertEqual(len(utterance.pcm_int16), speech_frames * VAD_WINDOW_SAMPLES)
+        self.assertEqual(utterance.duration_ms, (speech_frames + POST_PAD_FRAMES) * FRAME_MS)
+        self.assertEqual(
+            len(utterance.pcm_int16),
+            (speech_frames + POST_PAD_FRAMES) * VAD_WINDOW_SAMPLES,
+        )
         self.assertEqual(utterance.pcm_int16.dtype, np.int16)
+
+    def test_mid_sentence_pause_does_not_split_phrase(self):
+        """Пауза "подумать" внутри предложения (больше старых 700 мс) не рвёт фразу."""
+        model = LoudnessModel()
+        segmenter = self.make_segmenter(model)
+
+        # 25 тихих окон = 800 мс: раньше (порог 700 мс) фраза бы уже оборвалась здесь
+        mid_pause_frames = 25
+        self.assertGreater(mid_pause_frames * FRAME_MS, 700)
+        self.assertLess(mid_pause_frames, SILENCE_FRAMES)
+
+        self.feed(segmenter, [loud_frame() for _ in range(20)])
+        self.feed(segmenter, [quiet_frame() for _ in range(mid_pause_frames)])
+        self.feed(segmenter, [loud_frame() for _ in range(20)])
+        self.assertEqual(self.utterances, [], "пауза внутри предложения не должна завершать фразу")
+
+        # настоящая пауза — фраза отдаётся целиком, одной пачкой
+        self.feed(segmenter, [quiet_frame() for _ in range(SILENCE_FRAMES)])
+        self.assertEqual(len(self.utterances), 1, "фраза должна быть одной, а не двумя кусками")
+        # вся речь (20 + 20 окон) сохранена, ничего не потеряно
+        self.assertGreaterEqual(self.utterances[0].duration_ms, 40 * FRAME_MS)
+
+    def test_post_speech_padding_keeps_word_endings(self):
+        """Тихие окончания последних слов не отрезаются: в конец фразы
+        добавляется до POST_SPEECH_PADDING_MS аудио после речи."""
+        model = LoudnessModel()
+        segmenter = self.make_segmenter(model)
+
+        speech_frames = 20
+        self.feed(segmenter, [loud_frame() for _ in range(speech_frames)])
+        self.feed(segmenter, [quiet_frame() for _ in range(SILENCE_FRAMES)])
+
+        self.assertEqual(len(self.utterances), 1)
+        utterance = self.utterances[0]
+        self.assertEqual(utterance.duration_ms, (speech_frames + POST_PAD_FRAMES) * FRAME_MS)
+        self.assertEqual(
+            len(utterance.pcm_int16),
+            (speech_frames + POST_PAD_FRAMES) * VAD_WINDOW_SAMPLES,
+        )
 
     def test_short_blip_is_discarded(self):
         """Короткий щелчок/вдох короче MIN_UTTERANCE_MS фразой не считается."""
@@ -135,7 +179,7 @@ class VadSegmenterTestCase(unittest.TestCase):
 
         self.assertEqual(len(self.utterances), 2)
         for utterance in self.utterances:
-            self.assertEqual(utterance.duration_ms, 30 * FRAME_MS)
+            self.assertEqual(utterance.duration_ms, (30 + POST_PAD_FRAMES) * FRAME_MS)
 
     def test_long_speech_is_force_split(self):
         """Речь без пауз форсированно режется по MAX_UTTERANCE_MS."""
@@ -186,7 +230,7 @@ class VadSegmenterTestCase(unittest.TestCase):
         self.feed(segmenter, [quiet_frame() for _ in range(len(probabilities))])
 
         self.assertEqual(len(self.utterances), 1, "серая зона не должна разрывать фразу на две")
-        self.assertEqual(self.utterances[0].duration_ms, 30 * FRAME_MS)
+        self.assertEqual(self.utterances[0].duration_ms, (30 + POST_PAD_FRAMES) * FRAME_MS)
 
     def test_pre_speech_padding_is_included(self):
         """В начало фразы добавляется запас аудио, чтобы не отрезать первый звук."""

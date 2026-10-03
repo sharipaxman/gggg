@@ -97,7 +97,10 @@ python main.py
    влияет на следующую.
 
 Параметры (`VAD_THRESHOLD`, `VAD_NEG_THRESHOLD`, `END_OF_SPEECH_SILENCE_MS`,
-`MIN_UTTERANCE_MS`, `MAX_UTTERANCE_MS`) настраиваются в `app/config.py`.
+`POST_SPEECH_PADDING_MS`, `MIN_UTTERANCE_MS`, `MAX_UTTERANCE_MS`)
+настраиваются в `app/config.py`. Если фразы всё ещё рвутся посреди
+предложения — увеличьте `END_OF_SPEECH_SILENCE_MS` (например, до 1500);
+если перевод появляется слишком поздно — уменьшите.
 
 ### Почему Silero VAD, а не webrtcvad
 
