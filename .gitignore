@@ -1,0 +1,22 @@
+# Локальные данные приложения: БД истории, скриншоты, скачанные модели
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Виртуальные окружения
+.venv/
+venv/
+env/
+
+# Кеш torch.hub, если он вдруг оказался в проекте
+torch_hub/
+
+# IDE / ОС
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
