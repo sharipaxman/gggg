@@ -25,7 +25,7 @@ from app.pipeline import LessonPipeline, PhraseResult
 from app.assistant import Assistance
 from app.hotkey_manager import HotkeyManager
 from app.history_store import HistoryEntry
-from app.config import HOTKEY_ATTACH_SCREENSHOT, HOTKEY_TOGGLE_LISTEN, HISTORY_LIMIT, OLLAMA_MODEL
+from app.config import HOTKEY_ATTACH_SCREENSHOT, HOTKEY_TOGGLE_LISTEN, HISTORY_LIMIT, OLLAMA_MODEL, ASSISTANT_CONTEXT_ENTRIES
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +184,7 @@ class MainWindow(QMainWindow):
         self.assistant_checkbox = QCheckBox(f"ИИ-подсказки по контексту (Ollama: {OLLAMA_MODEL})")
         self.assistant_checkbox.setStyleSheet("color: #d1e8db;")
         self.assistant_checkbox.setToolTip(
-            "Нужны запущенная Ollama и загруженная модель. Последние 6 реплик передаются "
+            f"Нужны запущенная Ollama и загруженная модель. Последние {ASSISTANT_CONTEXT_ENTRIES} реплик передаются "
             "только локальной модели. Скриншоты не анализируются."
         )
         self.assistant_checkbox.toggled.connect(self.pipeline.set_assistant_enabled)

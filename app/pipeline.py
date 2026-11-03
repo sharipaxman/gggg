@@ -14,7 +14,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Callable, Optional, TYPE_CHECKING
 
-from app.assistant import Assistance, ConversationAssistant
+from app.assistant import Assistance, ConversationAssistant, is_explicit_reply_request
 from app.config import ASSISTANT_CONTEXT_ENTRIES
 from app.history_store import HistoryStore
 from app.translator import Translator, target_language
@@ -59,7 +59,7 @@ class LessonPipeline:
 
         self._work_queue: "queue.Queue[Utterance]" = queue.Queue()
         # Отдельная очередь ИИ: медленная LLM не задерживает распознавание/перевод.
-        # Храним только самый свежий ожидающий запрос, чтобы не копить устаревшие вопросы.
+        # Один ожидающий запрос; явные вопросы/просьбы приоритетнее утверждений.
         self._assistant_queue = queue.Queue(maxsize=1)
         self._assistant_thread: Optional[threading.Thread] = None
         self._worker_thread: Optional[threading.Thread] = None
@@ -166,10 +166,18 @@ class LessonPipeline:
                     self._assistant_queue.put_nowait((result, context))
                 except queue.Full:
                     try:
-                        stale, _ = self._assistant_queue.get_nowait()
+                        stale, stale_context = self._assistant_queue.get_nowait()
                     except queue.Empty:
                         pass
                     else:
+                        stale_needs_reply = (is_explicit_reply_request(stale.source_text)
+                                             or "?" in stale.source_text)
+                        new_needs_reply = (is_explicit_reply_request(result.source_text)
+                                           or "?" in result.source_text)
+                        if stale_needs_reply and not new_needs_reply:
+                            self._assistant_queue.put_nowait((stale, stale_context))
+                            self.on_phrase(replace(result, assistance_status="Пропущено: ожидается ответ на вопрос"))
+                            return
                         self.on_phrase(replace(stale, assistance_status="Пропущено: появилась более новая фраза"))
                     self._assistant_queue.put_nowait((result, context))
         except Exception as exc:

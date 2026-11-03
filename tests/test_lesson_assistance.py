@@ -156,6 +156,22 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(pending.source_text, "New question?")
         self.assertIn("Пропущено", self.results[-1].assistance_status)
 
+    def test_statement_cannot_evict_pending_reply_request(self):
+        self.pipeline.set_assistant_enabled(True)
+        self.recognize(text="Tell me the origin of your name.")
+        self.recognize(text="We are talking about names.")
+        pending, _ = self.pipeline._assistant_queue.get_nowait()
+        self.assertEqual(pending.source_text, "Tell me the origin of your name.")
+        self.assertIn("ожидается ответ", self.results[-1].assistance_status)
+        self.assertEqual(len(self.pipeline.history.get_recent()), 2)
+
+    def test_new_question_evicts_pending_statement(self):
+        self.pipeline.set_assistant_enabled(True)
+        self.recognize(text="We are talking about names.")
+        self.recognize(text="Tell me the origin of your name.")
+        pending, _ = self.pipeline._assistant_queue.get_nowait()
+        self.assertEqual(pending.source_text, "Tell me the origin of your name.")
+
     def test_disable_skips_pending_ai_request(self):
         self.pipeline.set_assistant_enabled(True)
         self.recognize()
