@@ -16,6 +16,7 @@ from typing import Callable, Optional, TYPE_CHECKING
 
 from app.assistant import Assistance, ConversationAssistant, is_explicit_reply_request
 from app.config import ASSISTANT_CONTEXT_ENTRIES
+from app.assistant_workspace import AssistantWorkspace, ContextChat
 from app.history_store import HistoryStore
 from app.translator import Translator, target_language
 
@@ -35,6 +36,8 @@ class PhraseResult:
     target_language: str = "ru"
     assistance: Assistance = field(default_factory=Assistance)
     assistance_status: str = "ИИ-подсказки выключены"
+    memory_generation: int = 0
+    memory_context: list = field(default_factory=list)
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
 
 
@@ -54,6 +57,8 @@ class LessonPipeline:
         self.translator = Translator()
         self.history = HistoryStore()
         self.assistant = ConversationAssistant()
+        self.workspace = AssistantWorkspace()
+        self.chat = ContextChat(self.assistant, self.workspace)
         self._assistant_enabled = threading.Event()
         self.screenshots = ScreenshotManager()
 
@@ -140,6 +145,8 @@ class LessonPipeline:
             use_assistant = self._assistant_enabled.is_set()
             # Контекст до текущей фразы, в хронологическом порядке.
             context = list(reversed(self.history.get_recent(ASSISTANT_CONTEXT_ENTRIES))) if use_assistant else []
+            generation, memory_context = self.workspace.snapshot()
+            self.workspace.remember("heard", source_text)
             screenshot_path = self.screenshots.pop_pending()
 
             entry_id = self.history.add_entry(
@@ -155,6 +162,7 @@ class LessonPipeline:
                 translated_text=translated_text,
                 screenshot_path=screenshot_path,
                 entry_id=entry_id,
+                memory_generation=generation, memory_context=memory_context,
                 source_language=source_language,
                 target_language=target,
                 assistance_status="ИИ анализирует контекст…" if use_assistant else "ИИ-подсказки выключены",
@@ -174,7 +182,8 @@ class LessonPipeline:
                                              or "?" in stale.source_text)
                         new_needs_reply = (is_explicit_reply_request(result.source_text)
                                            or "?" in result.source_text)
-                        if stale_needs_reply and not new_needs_reply:
+                        if (not self.workspace.preferences().always_reply
+                                and stale_needs_reply and not new_needs_reply):
                             self._assistant_queue.put_nowait((stale, stale_context))
                             self.on_phrase(replace(result, assistance_status="Пропущено: ожидается ответ на вопрос"))
                             return
@@ -200,12 +209,32 @@ class LessonPipeline:
             self.on_phrase(replace(result, assistance_status="ИИ-подсказки выключены"))
             return
         try:
-            assistance = self.assistant.suggest(
-                result.source_text, result.translated_text, result.source_language, context,
-            )
+            if result.memory_generation != self.workspace.snapshot()[0]:
+                self.on_phrase(replace(result, assistance_status="Пропущено: память очищена"))
+                return
+            preferences = self.workspace.preferences()
+            if preferences.always_reply:
+                response = self.assistant.answer(
+                    result.source_text, result.memory_context, preferences.prompt,
+                )
+                assistance = Assistance(response=response)
+                self.workspace.remember("suggestion", response, result.memory_generation)
+                status = "Ответ по вашему промпту"
+            else:
+                assistance = self.assistant.suggest(
+                    result.source_text, result.translated_text, result.source_language, context,
+                    custom_prompt=preferences.prompt,
+                )
+                if assistance.suggestions:
+                    self.workspace.remember("suggestion", "\n".join(
+                        f"EN: {answer.en}\nRU: {answer.ru}" for answer in assistance.suggestions
+                    ), result.memory_generation)
+                status = ("Возможные ответы — примеры, проверьте перед использованием"
+                          if assistance.is_question else "Вопрос не обнаружен")
+            if result.memory_generation != self.workspace.snapshot()[0]:
+                self.on_phrase(replace(result, assistance_status="Пропущено: память очищена"))
+                return
             self.history.update_assistance(result.entry_id, assistance)
-            status = ("Возможные ответы — примеры, проверьте перед использованием"
-                      if assistance.is_question else "Вопрос не обнаружен")
         except Exception as exc:
             logger.warning("ИИ-подсказки недоступны: %s", exc)
             assistance = Assistance()
@@ -213,6 +242,10 @@ class LessonPipeline:
         # Новый объект: Qt мог ещё не обработать предыдущий сигнал.
         if not self._stop_event.is_set():
             self.on_phrase(replace(result, assistance=assistance, assistance_status=status))
+
+    def close(self):
+        self.chat.close()
+        self.stop()
 
     def capture_screenshot_now(self) -> str:
         """Вызывается по хоткею: сделать снимок и привязать к следующей фразе."""

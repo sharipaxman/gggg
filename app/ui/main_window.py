@@ -18,11 +18,12 @@ from PySide6.QtGui import QClipboard, QPixmap, QIcon
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QFrame, QSizePolicy, QListWidget, QListWidgetItem, QSplitter,
-    QStatusBar, QApplication, QMessageBox, QCheckBox,
+    QStatusBar, QApplication, QMessageBox, QCheckBox, QPlainTextEdit, QTabWidget,
 )
 
 from app.pipeline import LessonPipeline, PhraseResult
 from app.assistant import Assistance
+from app.assistant_workspace import PROMPT_MAX_CHARS, QUESTION_MAX_CHARS, MEMORY_LIMIT, CONTEXT_CHAR_BUDGET
 from app.hotkey_manager import HotkeyManager
 from app.history_store import HistoryEntry
 from app.config import HOTKEY_ATTACH_SCREENSHOT, HOTKEY_TOGGLE_LISTEN, HISTORY_LIMIT, OLLAMA_MODEL, ASSISTANT_CONTEXT_ENTRIES
@@ -36,6 +37,7 @@ class PipelineBridge(QObject):
 
     phrase_ready = Signal(object)   # PhraseResult
     error_occurred = Signal(str)
+    chat_ready = Signal(object)
 
 
 class SuggestionsWidget(QWidget):
@@ -57,6 +59,16 @@ class SuggestionsWidget(QWidget):
             label.setWordWrap(True)
             label.setStyleSheet("color: #aab8cf; font-size: 12px;")
             self.rows.addWidget(label)
+        if assistance.response:
+            label = QLabel(assistance.response)
+            label.setTextFormat(Qt.PlainText)
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            label.setStyleSheet("color: #d1e8db; font-size: 14px;")
+            self.rows.addWidget(label)
+            copy = QPushButton("Копировать ответ ИИ")
+            copy.clicked.connect(lambda: QApplication.clipboard().setText(assistance.response))
+            self.rows.addWidget(copy)
         for index, answer in enumerate(assistance.suggestions, 1):
             card = QWidget()
             layout = QVBoxLayout(card)
@@ -110,9 +122,9 @@ class HistoryItemWidget(QFrame):
         row.addWidget(copy_btn)
         layout.addLayout(row)
 
-        if entry.assistance.suggestions:
+        if entry.assistance.suggestions or entry.assistance.response:
             answers = SuggestionsWidget()
-            answers.show_assistance(entry.assistance, "Возможные ответы (примеры)")
+            answers.show_assistance(entry.assistance, "Ответ ИИ" if entry.assistance.response else "Возможные ответы (примеры)")
             layout.addWidget(answers)
 
         if entry.screenshot_path and Path(entry.screenshot_path).exists():
@@ -131,14 +143,16 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("EN Lesson Translator — локальный помощник на уроках английского")
-        self.resize(980, 640)
+        self.resize(1200, 800)
         self.setStyleSheet("QMainWindow { background-color: #1e1f22; }")
 
         self.bridge = PipelineBridge()
         self.bridge.phrase_ready.connect(self._on_phrase_ready)
         self.bridge.error_occurred.connect(self._on_error)
+        self.bridge.chat_ready.connect(self._on_chat_ready)
 
         self._current_entry_id = 0
+        self._last_chat_answer = ""
         self.pipeline = LessonPipeline(on_phrase=self._emit_phrase_ready,
                                        on_error=self.bridge.error_occurred.emit)
         self.hotkeys = HotkeyManager(
@@ -184,8 +198,8 @@ class MainWindow(QMainWindow):
         self.assistant_checkbox = QCheckBox(f"ИИ-подсказки по контексту (Ollama: {OLLAMA_MODEL})")
         self.assistant_checkbox.setStyleSheet("color: #d1e8db;")
         self.assistant_checkbox.setToolTip(
-            f"Нужны запущенная Ollama и загруженная модель. Последние {ASSISTANT_CONTEXT_ENTRIES} реплик передаются "
-            "только локальной модели. Скриншоты не анализируются."
+            "Нужны запущенная Ollama и загруженная модель. Промпт и ограниченный фрагмент памяти "
+            "передаются только локальной модели. Скриншоты не анализируются."
         )
         self.assistant_checkbox.toggled.connect(self.pipeline.set_assistant_enabled)
         left_layout.addWidget(self.assistant_checkbox)
@@ -218,9 +232,9 @@ class MainWindow(QMainWindow):
         copy_row.addStretch()
         current_layout.addLayout(copy_row)
 
-        current_layout.addWidget(self._section_label("Как можно ответить"))
+        current_layout.addWidget(self._section_label("Ответ ИИ"))
         self.suggestions_widget = SuggestionsWidget()
-        self.suggestions_widget.show_assistance(Assistance(), "Включите ИИ-подсказки для анализа вопросов")
+        self.suggestions_widget.show_assistance(Assistance(), "Включите автоответы ИИ; промпт задаётся во вкладке справа")
         current_layout.addWidget(self.suggestions_widget)
 
         current_scroll = QScrollArea()
@@ -254,10 +268,127 @@ class MainWindow(QMainWindow):
         self.history_scroll.setWidget(self.history_container)
         right_layout.addWidget(self.history_scroll)
 
-        splitter.addWidget(right_panel)
+        right_tabs = QTabWidget()
+        right_tabs.addTab(self._build_assistant_panel(), "Промпт и чат")
+        right_tabs.addTab(right_panel, "История переводов")
+        splitter.addWidget(right_tabs)
         splitter.setSizes([480, 500])
 
         self.setStatusBar(QStatusBar())
+
+    def _build_assistant_panel(self):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        preferences = self.pipeline.workspace.preferences()
+        layout.addWidget(self._section_label(f"Инструкция ИИ (до {PROMPT_MAX_CHARS} символов)"))
+        self.prompt_edit = QPlainTextEdit()
+        self.prompt_edit.setPlaceholderText("Например: объясняй новые слова; отвечай кратко по-русски…")
+        self.prompt_edit.setPlainText(preferences.prompt)
+        self.prompt_edit.setMaximumHeight(110)
+        layout.addWidget(self.prompt_edit)
+        self.always_reply_checkbox = QCheckBox("Обрабатывать каждую реплику по промпту, не только вопросы")
+        self.always_reply_checkbox.setChecked(preferences.always_reply)
+        layout.addWidget(self.always_reply_checkbox)
+        apply_btn = QPushButton("Применить и сохранить промпт")
+        apply_btn.clicked.connect(self._save_preferences)
+        layout.addWidget(apply_btn)
+
+        self.memory_info = self._section_label(
+            f"Память: до {MEMORY_LIMIT} событий на диске; в запросе свежий фрагмент до {CONTEXT_CHAR_BUDGET} символов"
+        )
+        self.memory_info.setWordWrap(True)
+        layout.addWidget(self.memory_info)
+        self.memory_preview = QPlainTextEdit()
+        self.memory_preview.setReadOnly(True)
+        self.memory_preview.setMaximumHeight(90)
+        layout.addWidget(self.memory_preview)
+        self.clear_memory_btn = QPushButton("Очистить память и чат (переводы останутся)")
+        self.clear_memory_btn.clicked.connect(self._clear_memory)
+        layout.addWidget(self.clear_memory_btn)
+
+        layout.addWidget(self._section_label("Вопрос ИИ по контексту — работает и без прослушивания"))
+        self.chat_view = QPlainTextEdit()
+        self.chat_view.setReadOnly(True)
+        layout.addWidget(self.chat_view, stretch=1)
+        self.question_edit = QPlainTextEdit()
+        self.question_edit.setPlaceholderText(f"Свой вопрос по контексту (до {QUESTION_MAX_CHARS} символов)…")
+        self.question_edit.setMaximumHeight(70)
+        layout.addWidget(self.question_edit)
+        buttons = QHBoxLayout()
+        self.ask_btn = QPushButton("Спросить по контексту")
+        self.ask_btn.clicked.connect(self._ask_question)
+        buttons.addWidget(self.ask_btn)
+        self.copy_chat_btn = QPushButton("Копировать последний ответ")
+        self.copy_chat_btn.clicked.connect(lambda: QApplication.clipboard().setText(self._last_chat_answer))
+        buttons.addWidget(self.copy_chat_btn)
+        layout.addLayout(buttons)
+        self.chat_status = QLabel("Промпт и память сохраняются локально. Автоответ включается флажком слева.")
+        self.chat_status.setTextFormat(Qt.PlainText)
+        self.chat_status.setWordWrap(True)
+        layout.addWidget(self.chat_status)
+        self._refresh_memory()
+        self._load_chat()
+        return panel
+
+    def _save_preferences(self):
+        try:
+            self.pipeline.workspace.save_preferences(
+                self.prompt_edit.toPlainText(), self.always_reply_checkbox.isChecked(),
+            )
+        except Exception as exc:
+            self.chat_status.setText(f"Не удалось сохранить промпт: {exc}")
+            return False
+        self.chat_status.setText("Промпт сохранён. Будет применяться к следующим запросам ИИ.")
+        return True
+
+    def _refresh_memory(self):
+        _, context = self.pipeline.workspace.snapshot()
+        roles = {"heard": "Услышано", "user": "Вы", "assistant": "ИИ", "suggestion": "Пример ИИ"}
+        self.memory_preview.setPlainText("\n".join(f"{roles[event['role']]}: {event['text']}" for event in context))
+
+    def _load_chat(self):
+        events = self.pipeline.workspace.recent(chat_only=True)
+        self.chat_view.setPlainText("\n\n".join(
+            f"{'Вы' if event['role'] == 'user' else 'ИИ'}: {event['text']}" for event in events
+        ))
+        answers = [event["text"] for event in events if event["role"] == "assistant"]
+        self._last_chat_answer = answers[-1] if answers else ""
+        bar = self.chat_view.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _set_chat_busy(self, busy: bool):
+        self.ask_btn.setEnabled(not busy)
+        self.question_edit.setEnabled(not busy)
+        self.clear_memory_btn.setEnabled(not busy)
+
+    def _ask_question(self):
+        if not self._save_preferences():
+            return
+        self._set_chat_busy(True)
+        self.chat_status.setText("ИИ отвечает… Если идёт автоответ, ручной запрос дождётся модели.")
+        try:
+            self.pipeline.chat.ask(self.question_edit.toPlainText(), self.bridge.chat_ready.emit)
+            self.question_edit.clear()
+            self._load_chat()
+            self._refresh_memory()
+        except Exception as exc:
+            self._set_chat_busy(False)
+            self.chat_status.setText(str(exc))
+
+    def _on_chat_ready(self, result):
+        self._set_chat_busy(False)
+        self._load_chat()
+        self._refresh_memory()
+        self.chat_status.setText(f"Ошибка: {result.error}" if result.error else "Ответ готов и сохранён в чате.")
+
+    def _clear_memory(self):
+        if QMessageBox.question(self, "Очистить память?",
+                                "Удалить память ИИ и ручной чат? Промпт и история переводов останутся.") != QMessageBox.Yes:
+            return
+        self.pipeline.workspace.clear_memory()
+        self._load_chat()
+        self._refresh_memory()
+        self.chat_status.setText("Память очищена. Начат новый контекст.")
 
     @staticmethod
     def _section_label(text: str) -> QLabel:
@@ -338,6 +469,7 @@ class MainWindow(QMainWindow):
         self.bridge.phrase_ready.emit(result)
 
     def _on_phrase_ready(self, result: PhraseResult):
+        self._refresh_memory()
         if result.entry_id >= self._current_entry_id:
             self._current_entry_id = result.entry_id
             self.source_title.setText(
@@ -362,7 +494,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         try:
-            self.pipeline.stop()
+            self._save_preferences()
+            self.pipeline.close()
             self.hotkeys.stop()
         except Exception:
             logger.exception("Ошибка при закрытии приложения")

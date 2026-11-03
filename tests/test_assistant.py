@@ -75,6 +75,37 @@ class AssistantTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Некорректный ответ"):
             self.client.suggest("Tell me the origin of your name.", "Расскажи о своём имени.", "en", [])
 
+    def test_custom_answer_uses_prompt_and_memory_without_question_gate(self):
+        self.respond('{"answer":"Сегодня обсуждали поездку."}')
+        answer = self.client.answer("I went to Paris.", [{"role": "heard", "text": "We discuss travel."}],
+                                    "Отвечай кратко по-русски")
+        self.assertEqual(answer, "Сегодня обсуждали поездку.")
+        body = json.loads(self.client._opener.open.call_args.args[0].data)
+        self.assertIn("Отвечай кратко по-русски", body["messages"][0]["content"])
+        data = json.loads(body["messages"][1]["content"])
+        self.assertEqual(data["task"], "heard_utterance")
+        self.assertEqual(data["memory"][0]["role"], "heard")
+        self.assertNotIn("is_question", body["format"]["properties"])
+        self.assertNotIn("suggestions", body["format"]["properties"])
+
+    def test_manual_question_is_distinguished_from_heard_speech(self):
+        self.respond('{"answer":"Paris"}')
+        self.client.answer("Which city?", [], "Be concise", manual=True)
+        body = json.loads(self.client._opener.open.call_args.args[0].data)
+        self.assertEqual(json.loads(body["messages"][1]["content"])["task"], "manual_question")
+
+    def test_free_answer_validation(self):
+        for value in ('{}', '{"answer":" "}', '{"answer":false}'):
+            with self.subTest(value=value):
+                self.respond(value)
+                with self.assertRaisesRegex(RuntimeError, "некорректный"):
+                    self.client.answer("Q", [], "")
+
+    def test_free_response_history_round_trip_and_legacy_json(self):
+        answer = Assistance(response="Произвольный ответ")
+        self.assertEqual(Assistance.from_json(answer.to_json()), answer)
+        self.assertEqual(Assistance.from_json('{"is_question":false,"suggestions":[]}'), Assistance())
+
     def test_statement_has_no_answers(self):
         self.respond('{"is_question":false,"suggestions":[]}')
         self.assertEqual(self.client.suggest("Hello", "Привет", "en", []), Assistance())

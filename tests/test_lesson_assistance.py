@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from app.assistant import Assistance, AnswerSuggestion
 from app.history_store import HistoryStore
+from app.assistant_workspace import AssistantWorkspace
 from app.pipeline import LessonPipeline
 from app.translator import Translator, target_language
 from scripts.setup_models import setup_argos_translate
@@ -88,6 +89,8 @@ class PipelineTests(unittest.TestCase):
         # Не создаём реальные аудиоустройства/VAD/Whisper.
         self.pipeline = LessonPipeline.__new__(LessonPipeline)
         self.pipeline.history = HistoryStore(Path(self.temp.name) / "history.db")
+        self.pipeline.workspace = AssistantWorkspace(Path(self.temp.name) / "history.db")
+        self.pipeline.workspace.save_preferences("", False)  # legacy question-only tests
         self.pipeline.recognizer = MagicMock()
         self.pipeline.translator = MagicMock()
         self.pipeline.screenshots = MagicMock()
@@ -109,6 +112,50 @@ class PipelineTests(unittest.TestCase):
 
     def finish_assistance(self):
         self.pipeline._process_assistance(*self.pipeline._assistant_queue.get_nowait())
+
+    def test_always_reply_processes_statement_with_custom_prompt(self):
+        self.pipeline.workspace.save_preferences("Отвечай одним предложением на русском", True)
+        self.pipeline.workspace.remember("heard", "We are discussing holidays.")
+        self.pipeline.assistant.answer.return_value = "Речь о путешествиях."
+        self.pipeline.set_assistant_enabled(True)
+        self.recognize(text="I went to Paris.")
+        self.finish_assistance()
+        self.pipeline.assistant.answer.assert_called_once_with(
+            "I went to Paris.", [{"role": "heard", "text": "We are discussing holidays."}],
+            "Отвечай одним предложением на русском",
+        )
+        self.pipeline.assistant.suggest.assert_not_called()
+        self.assertEqual(self.results[-1].assistance.response, "Речь о путешествиях.")
+        self.assertEqual(self.pipeline.history.get_recent()[0].assistance.response, "Речь о путешествиях.")
+
+    def test_clear_during_generation_discards_stale_answer(self):
+        self.pipeline.workspace.save_preferences("Reply", True)
+        self.pipeline.set_assistant_enabled(True)
+        self.recognize(text="A statement.")
+
+        def answer_and_clear(*args, **kwargs):
+            self.pipeline.workspace.clear_memory()
+            return "Stale answer"
+
+        self.pipeline.assistant.answer.side_effect = answer_and_clear
+        self.finish_assistance()
+        self.assertIn("память очищена", self.results[-1].assistance_status)
+        self.assertEqual(self.pipeline.workspace.recent(), [])
+        self.assertEqual(self.pipeline.history.get_recent()[0].assistance.response, "")
+
+    def test_context_accumulates_even_if_auto_ai_disabled(self):
+        self.recognize(text="My name is Alex.")
+        _, context = self.pipeline.workspace.snapshot()
+        self.assertEqual(context, [{"role": "heard", "text": "My name is Alex."}])
+        self.pipeline.assistant.answer.assert_not_called()
+
+    def test_cleared_memory_does_not_send_old_pending_context(self):
+        self.pipeline.set_assistant_enabled(True)
+        self.recognize()
+        self.pipeline.workspace.clear_memory()
+        self.finish_assistance()
+        self.pipeline.assistant.suggest.assert_not_called()
+        self.assertIn("память очищена", self.results[-1].assistance_status)
 
     def test_both_directions_without_ai(self):
         for language, target in (("en", "ru"), ("ru", "en")):
@@ -190,7 +237,7 @@ class PipelineTests(unittest.TestCase):
         pipeline._running = False
         ai_started, release_ai, translated_second = (threading.Event() for _ in range(3))
 
-        def slow_suggestion(*args):
+        def slow_suggestion(*args, **kwargs):
             ai_started.set()
             release_ai.wait(timeout=3)
             return Assistance()

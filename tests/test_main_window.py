@@ -10,6 +10,7 @@ try:
     from app.assistant import Assistance, AnswerSuggestion
     from app.history_store import HistoryEntry
     from app.pipeline import PhraseResult
+    from app.assistant_workspace import AssistantPreferences, ChatResult
     QT_AVAILABLE = True
 except ImportError:
     QT_AVAILABLE = False
@@ -30,6 +31,9 @@ class MainWindowTests(unittest.TestCase):
         self.addCleanup(self.hotkeys_patch.stop)
         self.pipeline = self.pipeline_factory.return_value
         self.pipeline.history.get_recent.return_value = []
+        self.pipeline.workspace.preferences.return_value = AssistantPreferences()
+        self.pipeline.workspace.snapshot.return_value = (0, [])
+        self.pipeline.workspace.recent.return_value = []
         self.window = MainWindow()
         self.addCleanup(self.window.close)
 
@@ -61,6 +65,28 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(QApplication.clipboard().text(), "Because…")
         buttons[1].click()
         self.assertEqual(QApplication.clipboard().text(), "Потому что…")
+
+    def test_prompt_applies_and_manual_question_does_not_start_listening(self):
+        self.window.prompt_edit.setPlainText("Summarize in Russian")
+        self.window._save_preferences()
+        self.pipeline.workspace.save_preferences.assert_called_with("Summarize in Russian", True)
+        self.window.question_edit.setPlainText("What did we discuss?")
+        self.window._ask_question()
+        self.pipeline.chat.ask.assert_called_once()
+        self.assertEqual(self.pipeline.chat.ask.call_args.args[0], "What did we discuss?")
+        self.pipeline.start.assert_not_called()
+        self.assertFalse(self.window.ask_btn.isEnabled())
+        self.window._on_chat_ready(ChatResult("What did we discuss?", error="Offline"))
+        self.assertTrue(self.window.ask_btn.isEnabled())
+        self.assertIn("Offline", self.window.chat_status.text())
+
+    def test_free_response_is_shown_and_can_be_copied(self):
+        result = PhraseResult("A statement.", "Утверждение.", None, 1,
+                              assistance=Assistance(response="Свободный ответ"))
+        self.window._on_phrase_ready(result)
+        buttons = self.window.suggestions_widget.findChildren(QPushButton)
+        buttons[0].click()
+        self.assertEqual(QApplication.clipboard().text(), "Свободный ответ")
 
     def test_history_load_newest_first(self):
         self.pipeline.history.get_recent.return_value = [
