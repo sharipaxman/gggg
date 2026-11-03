@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -18,6 +19,12 @@ from app.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RecognitionResult:
+    text: str
+    language: str
 
 
 class SpeechRecognizer:
@@ -43,12 +50,18 @@ class SpeechRecognizer:
         logger.info("Модель Whisper загружена")
 
     def transcribe_pcm16(self, pcm_int16: np.ndarray, sample_rate: int) -> str:
-        """Принимает PCM int16 моно, возвращает распознанный английский текст."""
+        """Совместимый текстовый API; для языка используйте recognize_pcm16."""
+        return self.recognize_pcm16(pcm_int16, sample_rate).text
+
+    def recognize_pcm16(self, pcm_int16: np.ndarray, sample_rate: int) -> RecognitionResult:
+        """Распознаёт исходную речь без перевода, возвращает текст и язык."""
+        if sample_rate != 16000:
+            raise ValueError("Whisper ожидает звук с частотой 16000 Гц")
         self._ensure_model()
         audio_f32 = pcm_int16.astype(np.float32) / 32768.0
 
         with self._lock:
-            segments, _info = self._model.transcribe(
+            segments, info = self._model.transcribe(
                 audio_f32,
                 language=WHISPER_LANGUAGE,
                 task="transcribe",
@@ -56,4 +69,4 @@ class SpeechRecognizer:
                 beam_size=5,
             )
             text = " ".join(seg.text.strip() for seg in segments).strip()
-        return text
+        return RecognitionResult(text, info.language)

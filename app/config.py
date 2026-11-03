@@ -54,10 +54,10 @@ PRE_SPEECH_PADDING_MS = 300
 WHISPER_MODEL_SIZE = "small"       # tiny/base/small/medium — баланс скорости/точности
 WHISPER_DEVICE = "cpu"
 WHISPER_COMPUTE_TYPE = "int8"      # быстрее на CPU
-WHISPER_LANGUAGE = "en"
+WHISPER_LANGUAGE = None       # auto: определять EN/RU для каждой фразы
 
 # ---------------------------------------------------------------------------
-# Перевод (argostranslate, офлайн-пакет языков EN->RU)
+# Перевод (argostranslate, офлайн-пакеты EN <-> RU)
 # ---------------------------------------------------------------------------
 TRANSLATE_FROM = "en"
 TRANSLATE_TO = "ru"
@@ -72,3 +72,13 @@ HISTORY_LIMIT = 50
 # ---------------------------------------------------------------------------
 HOTKEY_ATTACH_SCREENSHOT = "ctrl+shift+s"
 HOTKEY_TOGGLE_LISTEN = "ctrl+shift+l"
+
+# ---------------------------------------------------------------------------
+# Локальный ИИ-помощник (Ollama). Включается отдельно в интерфейсе.
+# Разрешён только loopback: текст не должен незаметно уйти в облако.
+# ---------------------------------------------------------------------------
+OLLAMA_URL = os.environ.get("LESSON_OLLAMA_URL", "http://127.0.0.1:11434")
+OLLAMA_MODEL = os.environ.get("LESSON_OLLAMA_MODEL", "qwen2.5:7b")
+ASSISTANT_TIMEOUT_SECONDS = 30
+ASSISTANT_CONTEXT_ENTRIES = 6
+ASSISTANT_MAX_TEXT_CHARS = 2000

@@ -1,6 +1,6 @@
 """
 Разовая настройка: готовит модель Silero VAD, модель Whisper и языковой пакет
-Argos Translate (en->ru) на локальном диске, чтобы дальше приложение работало
+Argos Translate (en↔ru) на локальном диске, чтобы дальше приложение работало
 полностью офлайн.
 
 Запуск:  python scripts/setup_models.py
@@ -62,28 +62,23 @@ def setup_whisper():
 
 
 def setup_argos_translate():
-    logger.info("Установка офлайн-пакета перевода Argos Translate en->ru...")
+    logger.info("Установка офлайн-пакетов Argos Translate EN ↔ RU...")
     import argostranslate.package as argos_package
-    import argostranslate.translate as argos_translate
 
-    installed_languages = argos_translate.get_installed_languages()
-    has_en_ru = any(
-        l.code == "en" and any(t.to_lang.code == "ru" for t in getattr(l, "translations_from", []))
-        for l in installed_languages
-    )
-    if has_en_ru:
-        logger.info("Пакет en->ru уже установлен")
+    installed = {(p.from_code, p.to_code) for p in argos_package.get_installed_packages()}
+    required = [("en", "ru"), ("ru", "en")]
+    missing = [pair for pair in required if pair not in installed]
+    if not missing:
+        logger.info("Оба языковых пакета уже установлены")
         return
-
     argos_package.update_package_index()
     available = argos_package.get_available_packages()
-    pkg = next((p for p in available if p.from_code == "en" and p.to_code == "ru"), None)
-    if not pkg:
-        raise RuntimeError("Пакет перевода en->ru не найден в индексе Argos Translate")
-
-    path = pkg.download()
-    argos_package.install_from_path(path)
-    logger.info("Пакет перевода en->ru установлен")
+    for source, target in missing:
+        pkg = next((p for p in available if p.from_code == source and p.to_code == target), None)
+        if not pkg:
+            raise RuntimeError(f"Пакет перевода {source}→{target} не найден в индексе Argos Translate")
+        argos_package.install_from_path(pkg.download())
+        logger.info("Пакет перевода %s→%s установлен", source, target)
 
 
 if __name__ == "__main__":
