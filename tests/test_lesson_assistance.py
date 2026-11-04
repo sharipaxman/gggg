@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from app.assistant import Assistance, AnswerSuggestion
+from app.assistant import Assistance, AnswerSuggestion, AssistantReply
 from app.history_store import HistoryStore
 from app.assistant_workspace import AssistantWorkspace
 from app.pipeline import LessonPipeline
@@ -116,16 +116,18 @@ class PipelineTests(unittest.TestCase):
     def test_always_reply_processes_statement_with_custom_prompt(self):
         self.pipeline.workspace.save_preferences("Отвечай одним предложением на русском", True)
         self.pipeline.workspace.remember("heard", "We are discussing holidays.")
-        self.pipeline.assistant.answer.return_value = "Речь о путешествиях."
+        self.pipeline.assistant.reply.return_value = AssistantReply("Речь о путешествиях.", "We are discussing travel.", "ru", "en")
         self.pipeline.set_assistant_enabled(True)
         self.recognize(text="I went to Paris.")
         self.finish_assistance()
-        self.pipeline.assistant.answer.assert_called_once_with(
+        self.pipeline.assistant.reply.assert_called_once_with(
             "I went to Paris.", [{"role": "heard", "text": "We are discussing holidays."}],
             "Отвечай одним предложением на русском",
         )
         self.pipeline.assistant.suggest.assert_not_called()
         self.assertEqual(self.results[-1].assistance.response, "Речь о путешествиях.")
+        self.assertEqual(self.results[-1].assistance.response_translation, "We are discussing travel.")
+        self.assertEqual(self.pipeline.history.get_recent()[0].assistance.response_translation, "We are discussing travel.")
         self.assertEqual(self.pipeline.history.get_recent()[0].assistance.response, "Речь о путешествиях.")
 
     def test_clear_during_generation_discards_stale_answer(self):
@@ -135,9 +137,9 @@ class PipelineTests(unittest.TestCase):
 
         def answer_and_clear(*args, **kwargs):
             self.pipeline.workspace.clear_memory()
-            return "Stale answer"
+            return AssistantReply("Stale answer")
 
-        self.pipeline.assistant.answer.side_effect = answer_and_clear
+        self.pipeline.assistant.reply.side_effect = answer_and_clear
         self.finish_assistance()
         self.assertIn("память очищена", self.results[-1].assistance_status)
         self.assertEqual(self.pipeline.workspace.recent(), [])
@@ -147,7 +149,7 @@ class PipelineTests(unittest.TestCase):
         self.recognize(text="My name is Alex.")
         _, context = self.pipeline.workspace.snapshot()
         self.assertEqual(context, [{"role": "heard", "text": "My name is Alex."}])
-        self.pipeline.assistant.answer.assert_not_called()
+        self.pipeline.assistant.reply.assert_not_called()
 
     def test_cleared_memory_does_not_send_old_pending_context(self):
         self.pipeline.set_assistant_enabled(True)

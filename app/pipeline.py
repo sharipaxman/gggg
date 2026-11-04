@@ -214,11 +214,11 @@ class LessonPipeline:
                 return
             preferences = self.workspace.preferences()
             if preferences.always_reply:
-                response = self.assistant.answer(
+                reply = self.assistant.reply(
                     result.source_text, result.memory_context, preferences.prompt,
                 )
-                assistance = Assistance(response=response)
-                self.workspace.remember("suggestion", response, result.memory_generation)
+                assistance = Assistance.from_reply(reply)
+                self.workspace.remember("suggestion", reply.text, result.memory_generation, reply=reply)
                 status = "Ответ по вашему промпту"
             else:
                 assistance = self.assistant.suggest(

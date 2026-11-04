@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 from urllib.error import HTTPError, URLError
 
-from app.assistant import Assistance, AnswerSuggestion, ConversationAssistant, is_explicit_reply_request, RESPONSE_SCHEMA
+from app.assistant import Assistance, AnswerSuggestion, ConversationAssistant, is_explicit_reply_request, RESPONSE_SCHEMA, AssistantReply, resolve_task
 from app.config import ASSISTANT_CONTEXT_ENTRIES, ASSISTANT_MAX_TEXT_CHARS
 
 
@@ -82,9 +82,9 @@ class AssistantTests(unittest.TestCase):
         self.assertEqual(answer, "Сегодня обсуждали поездку.")
         body = json.loads(self.client._opener.open.call_args.args[0].data)
         self.assertIn("Отвечай кратко по-русски", body["messages"][0]["content"])
-        data = json.loads(body["messages"][1]["content"])
+        data = json.loads(body["messages"][-1]["content"])
         self.assertEqual(data["task"], "heard_utterance")
-        self.assertEqual(data["memory"][0]["role"], "heard")
+        self.assertIn("TRANSCRIPT", body["messages"][1]["content"])
         self.assertNotIn("is_question", body["format"]["properties"])
         self.assertNotIn("suggestions", body["format"]["properties"])
 
@@ -92,7 +92,7 @@ class AssistantTests(unittest.TestCase):
         self.respond('{"answer":"Paris"}')
         self.client.answer("Which city?", [], "Be concise", manual=True)
         body = json.loads(self.client._opener.open.call_args.args[0].data)
-        self.assertEqual(json.loads(body["messages"][1]["content"])["task"], "manual_question")
+        self.assertEqual(json.loads(body["messages"][-1]["content"])["task"], "manual_question")
 
     def test_free_answer_validation(self):
         for value in ('{}', '{"answer":" "}', '{"answer":false}'):
@@ -105,6 +105,91 @@ class AssistantTests(unittest.TestCase):
         answer = Assistance(response="Произвольный ответ")
         self.assertEqual(Assistance.from_json(answer.to_json()), answer)
         self.assertEqual(Assistance.from_json('{"is_question":false,"suggestions":[]}'), Assistance())
+
+    def test_arthur_clarification_completes_teacher_task_not_generic_name_discussion(self):
+        task = "Tell me about the origin of your name."
+        generic = "Your name origins can vary widely. If you could provide more details about your name..."
+        context = [{"role": "heard", "text": task}, {"role": "suggestion", "text": generic},
+                   {"role": "user", "text": "мое имя артур"}, {"role": "assistant", "text": generic}]
+        self.client._translator = MagicMock()
+        self.client._translator.translate.return_value = "Меня зовут Артур. Точное происхождение имени спорно."
+        self.respond('{"answer":"My name is Arthur. Its exact origin is debated.","answer_language":"en"}')
+        reply = self.client.reply("мое имя артур", context, "Помоги мне ответить преподавателю", manual=True)
+        body = json.loads(self.client._opener.open.call_args.args[0].data)
+        request = json.loads(body["messages"][-1]["content"])
+        self.assertEqual(request["task"], "complete_previous_task")
+        self.assertEqual(request["task_to_answer"], task)
+        self.assertEqual(request["learner_name"], "артур")
+        self.assertEqual(request["learner_facts"], ["мое имя артур"])
+        self.assertEqual([m["role"] for m in body["messages"]],
+                         ["system", "user", "assistant", "user", "assistant", "user"])
+        self.assertIn("first person", body["messages"][0]["content"])
+        self.assertIn("Do not ask for the name again", body["messages"][0]["content"])
+        self.assertIn("uncertain", body["messages"][0]["content"])
+        self.assertIn("answer_language", body["format"]["required"])
+        self.client._translator.translate.assert_called_once_with(reply.text, "en", "ru")
+        self.assertEqual(reply.translation, "Меня зовут Артур. Точное происхождение имени спорно.")
+        self.assertEqual(reply.language, "en")
+        self.assertEqual(Assistance.from_json(Assistance.from_reply(reply).to_json()), Assistance.from_reply(reply))
+
+    def test_clarification_resolution_is_not_hardcoded_to_arthur(self):
+        context = [{"role": "heard", "text": "Tell me about your name."}]
+        for text, name in (("моё имя Анна", "Анна"), ("меня зовут Илья", "Илья"),
+                           ("My name is Alice.", "Alice")):
+            with self.subTest(text=text):
+                resolved = resolve_task(text, context, True)
+                self.assertEqual(resolved["learner_name"], name)
+                self.assertEqual(resolved["task"], "complete_previous_task")
+        city = resolve_task("я живу в Казани", [{"role": "heard", "text": "Where do you live?"}], True)
+        self.assertEqual(city["task_to_answer"], "Where do you live?")
+        self.assertEqual(city["learner_facts"], ["я живу в Казани"])
+
+    def test_latest_name_correction_wins_even_if_it_repeats_an_older_name(self):
+        context = [{"role": "heard", "text": "Tell me about your name."},
+                   {"role": "user", "text": "мое имя Артур"}, {"role": "user", "text": "мое имя Анна"}]
+        resolved = resolve_task("мое имя Артур", context, True)
+        self.assertEqual(resolved["learner_name"], "Артур")
+        self.assertEqual(resolved["learner_facts"][-1], "мое имя Артур")
+
+    def test_new_question_is_not_replaced_with_previous_task(self):
+        context = [{"role": "heard", "text": "Tell me about your name."}]
+        for question in ("Объясни Present Perfect", "Сколько будет два плюс два?"):
+            resolved = resolve_task(question, context, True)
+            self.assertEqual(resolved["task"], "manual_question")
+            self.assertEqual(resolved["task_to_answer"], question)
+
+    def test_ai_drafts_are_not_learner_facts(self):
+        context = [{"role": "assistant", "text": "My name is Invented."},
+                   {"role": "suggestion", "text": "мое имя Придуманное"}]
+        resolved = resolve_task("Что мы обсуждали?", context, True)
+        self.assertEqual(resolved["learner_facts"], [])
+        self.assertEqual(resolved["learner_name"], "")
+
+    def test_translation_direction_ru_to_en_and_separate_output(self):
+        self.client._translator = MagicMock()
+        self.client._translator.translate.return_value = "My name is Arthur."
+        self.respond('{"answer":"Меня зовут Артур.","answer_language":"ru"}')
+        reply = self.client.reply("Q", [], "Отвечай на русском")
+        self.client._translator.translate.assert_called_once_with("Меня зовут Артур.", "ru", "en")
+        self.assertEqual(reply.translation, "My name is Arthur.")
+
+    def test_translation_failure_preserves_original_answer(self):
+        self.client._translator = MagicMock()
+        self.client._translator.translate.side_effect = RuntimeError("Пакет en→ru не установлен")
+        self.respond('{"answer":"My name is Arthur.","answer_language":"en"}')
+        with self.assertLogs("app.assistant", level="WARNING"):
+            reply = self.client.reply("Q", [], "")
+        self.assertEqual(reply.text, "My name is Arthur.")
+        self.assertEqual(reply.translation, "")
+        self.assertIn("Пакет", reply.translation_error)
+
+    def test_invalid_reply_language_is_not_sent_to_translator(self):
+        self.client._translator = MagicMock()
+        for language in (None, "de"):
+            self.respond(json.dumps({"answer": "Answer", "answer_language": language}))
+            with self.assertRaises(RuntimeError):
+                self.client.reply("Q", [], "")
+        self.client._translator.translate.assert_not_called()
 
     def test_statement_has_no_answers(self):
         self.respond('{"is_question":false,"suggestions":[]}')

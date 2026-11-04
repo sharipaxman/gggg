@@ -60,7 +60,8 @@ class SuggestionsWidget(QWidget):
             label.setStyleSheet("color: #aab8cf; font-size: 12px;")
             self.rows.addWidget(label)
         if assistance.response:
-            label = QLabel(assistance.response)
+            prefix = f"Ответ ИИ ({assistance.response_language.upper()}):\n" if assistance.response_language else ""
+            label = QLabel(prefix + assistance.response)
             label.setTextFormat(Qt.PlainText)
             label.setWordWrap(True)
             label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -69,6 +70,21 @@ class SuggestionsWidget(QWidget):
             copy = QPushButton("Копировать ответ ИИ")
             copy.clicked.connect(lambda: QApplication.clipboard().setText(assistance.response))
             self.rows.addWidget(copy)
+        if assistance.response_translation:
+            label = QLabel(f"Перевод ({assistance.translation_language.upper()}):\n{assistance.response_translation}")
+            label.setTextFormat(Qt.PlainText)
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            label.setStyleSheet("color: #b7c2d0; font-size: 14px;")
+            self.rows.addWidget(label)
+            copy = QPushButton("Копировать перевод подсказки")
+            copy.clicked.connect(lambda: QApplication.clipboard().setText(assistance.response_translation))
+            self.rows.addWidget(copy)
+        if assistance.translation_error:
+            warning = QLabel(f"Перевод подсказки недоступен: {assistance.translation_error}")
+            warning.setTextFormat(Qt.PlainText)
+            warning.setWordWrap(True)
+            self.rows.addWidget(warning)
         for index, answer in enumerate(assistance.suggestions, 1):
             card = QWidget()
             layout = QVBoxLayout(card)
@@ -153,6 +169,7 @@ class MainWindow(QMainWindow):
 
         self._current_entry_id = 0
         self._last_chat_answer = ""
+        self._last_chat_translation = ""
         self.pipeline = LessonPipeline(on_phrase=self._emit_phrase_ready,
                                        on_error=self.bridge.error_occurred.emit)
         self.hotkeys = HotkeyManager(
@@ -318,9 +335,12 @@ class MainWindow(QMainWindow):
         self.ask_btn = QPushButton("Спросить по контексту")
         self.ask_btn.clicked.connect(self._ask_question)
         buttons.addWidget(self.ask_btn)
-        self.copy_chat_btn = QPushButton("Копировать последний ответ")
+        self.copy_chat_btn = QPushButton("Копировать ответ")
         self.copy_chat_btn.clicked.connect(lambda: QApplication.clipboard().setText(self._last_chat_answer))
         buttons.addWidget(self.copy_chat_btn)
+        self.copy_chat_translation_btn = QPushButton("Копировать перевод")
+        self.copy_chat_translation_btn.clicked.connect(lambda: QApplication.clipboard().setText(self._last_chat_translation))
+        buttons.addWidget(self.copy_chat_translation_btn)
         layout.addLayout(buttons)
         self.chat_status = QLabel("Промпт и память сохраняются локально. Автоответ включается флажком слева.")
         self.chat_status.setTextFormat(Qt.PlainText)
@@ -348,11 +368,18 @@ class MainWindow(QMainWindow):
 
     def _load_chat(self):
         events = self.pipeline.workspace.recent(chat_only=True)
-        self.chat_view.setPlainText("\n\n".join(
-            f"{'Вы' if event['role'] == 'user' else 'ИИ'}: {event['text']}" for event in events
-        ))
-        answers = [event["text"] for event in events if event["role"] == "assistant"]
-        self._last_chat_answer = answers[-1] if answers else ""
+        blocks = []
+        for event in events:
+            blocks.append(f"{'Вы' if event['role'] == 'user' else 'ИИ'}: {event['text']}")
+            if event.get("translation"):
+                blocks.append(f"Перевод ({event.get('translation_language', '').upper()}): {event['translation']}")
+            if event.get("translation_error"):
+                blocks.append(f"Перевод недоступен: {event['translation_error']}")
+        self.chat_view.setPlainText("\n\n".join(blocks))
+        answers = [event for event in events if event["role"] == "assistant"]
+        self._last_chat_answer = answers[-1]["text"] if answers else ""
+        self._last_chat_translation = answers[-1].get("translation", "") if answers else ""
+        self.copy_chat_translation_btn.setEnabled(bool(self._last_chat_translation))
         bar = self.chat_view.verticalScrollBar()
         bar.setValue(bar.maximum())
 
@@ -379,7 +406,11 @@ class MainWindow(QMainWindow):
         self._set_chat_busy(False)
         self._load_chat()
         self._refresh_memory()
-        self.chat_status.setText(f"Ошибка: {result.error}" if result.error else "Ответ готов и сохранён в чате.")
+        self.chat_status.setText(
+            f"Ошибка: {result.error}" if result.error else
+            (f"Ответ готов. Перевод недоступен: {result.translation_error}" if result.translation_error
+             else "Ответ и перевод готовы и сохранены в чате.")
+        )
 
     def _clear_memory(self):
         if QMessageBox.question(self, "Очистить память?",

@@ -88,6 +88,31 @@ class MainWindowTests(unittest.TestCase):
         buttons[0].click()
         self.assertEqual(QApplication.clipboard().text(), "Свободный ответ")
 
+    def test_free_suggestion_has_separate_translation_and_copy_button(self):
+        result = PhraseResult("Tell me about your name.", "Расскажи о своём имени.", None, 1,
+                              assistance=Assistance(response="My name is Arthur.",
+                                                    response_translation="Меня зовут Артур.",
+                                                    response_language="en", translation_language="ru"))
+        self.window._on_phrase_ready(result)
+        buttons = self.window.suggestions_widget.findChildren(QPushButton)
+        buttons[0].click()
+        self.assertEqual(QApplication.clipboard().text(), "My name is Arthur.")
+        buttons[1].click()
+        self.assertEqual(QApplication.clipboard().text(), "Меня зовут Артур.")
+
+    def test_manual_translation_is_loaded_and_copied_after_restart(self):
+        self.pipeline.workspace.recent.return_value = [
+            {"role": "user", "text": "мое имя артур"},
+            {"role": "assistant", "text": "My name is Arthur.", "translation": "Меня зовут Артур.",
+             "translation_language": "ru"},
+        ]
+        self.window._load_chat()
+        self.assertIn("Перевод (RU): Меня зовут Артур.", self.window.chat_view.toPlainText())
+        self.window.copy_chat_translation_btn.click()
+        self.assertEqual(QApplication.clipboard().text(), "Меня зовут Артур.")
+        self.window.copy_chat_btn.click()
+        self.assertEqual(QApplication.clipboard().text(), "My name is Arthur.")
+
     def test_history_load_newest_first(self):
         self.pipeline.history.get_recent.return_value = [
             HistoryEntry(2, "now", "new", "новое", None),

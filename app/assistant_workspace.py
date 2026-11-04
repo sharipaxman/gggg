@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable
 
 from app.config import DB_PATH
+from app.assistant import AssistantReply, active_heard_task, is_learner_fact
 
 DEFAULT_PROMPT = (
     "Ты мой помощник на уроке английского. Учитывай контекст разговора. "
@@ -34,6 +35,10 @@ class ChatResult:
     question: str
     answer: str = ""
     error: str = ""
+    translation: str = ""
+    answer_language: str = ""
+    translation_language: str = ""
+    translation_error: str = ""
 
 
 class AssistantWorkspace:
@@ -53,6 +58,10 @@ class AssistantWorkspace:
             conn.execute("""CREATE TABLE IF NOT EXISTS assistant_memory (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL,
                 role TEXT NOT NULL, text TEXT NOT NULL)""")
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(assistant_memory)")}
+            for name in ("translation", "answer_language", "translation_language", "translation_error"):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE assistant_memory ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
             # Подхватываем старую историю один раз, но не после очистки памяти.
             if not exists and conn.execute("SELECT 1 FROM sqlite_master WHERE name='phrases'").fetchone():
                 conn.execute("""INSERT INTO assistant_memory (created_at, role, text)
@@ -79,35 +88,52 @@ class AssistantWorkspace:
         with self._lock, self._connect() as conn:
             conn.execute("INSERT OR REPLACE INTO assistant_settings VALUES ('preferences', ?)", (value,))
 
-    def remember(self, role: str, text: str, generation: int | None = None):
+    def remember(self, role: str, text: str, generation: int | None = None, reply: AssistantReply | None = None):
         if role not in ("heard", "user", "assistant", "suggestion") or not text.strip():
             raise ValueError("Некорректное событие памяти")
         with self._lock, self._connect() as conn:
             if generation is not None and generation != self._generation:
                 return
-            conn.execute("INSERT INTO assistant_memory (created_at, role, text) VALUES (?, ?, ?)",
-                         (datetime.now().isoformat(timespec="seconds"), role, text))
+            conn.execute("INSERT INTO assistant_memory "
+                         "(created_at, role, text, translation, answer_language, translation_language, translation_error) "
+                         "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                         (datetime.now().isoformat(timespec="seconds"), role, text,
+                          reply.translation if reply else "", reply.language if reply else "",
+                          reply.target_language if reply else "", reply.translation_error if reply else ""))
             conn.execute("DELETE FROM assistant_memory WHERE id NOT IN "
                          "(SELECT id FROM assistant_memory ORDER BY id DESC LIMIT ?)", (MEMORY_LIMIT,))
 
     def recent(self, chat_only: bool = False) -> list[dict]:
         where = "WHERE role IN ('user', 'assistant')" if chat_only else ""
         with self._lock, self._connect() as conn:
-            rows = conn.execute(f"SELECT role, text, created_at FROM assistant_memory {where} ORDER BY id").fetchall()
+            rows = conn.execute(f"SELECT role, text, created_at, translation, answer_language, translation_language, translation_error FROM assistant_memory {where} ORDER BY id").fetchall()
         return [dict(row) for row in rows]
 
     def snapshot(self) -> tuple[int, list[dict]]:
         """Свежие события в хронологическом порядке, с ограниченным размером."""
         with self._lock:
-            selected, remaining = [], CONTEXT_CHAR_BUDGET
-            for event in reversed(self.recent()):
-                if remaining <= 0:
-                    break
-                # Последние части длинных ответов не вытесняют весь разговор.
-                text = event["text"][:min(800, remaining)]
-                selected.append({"role": event["role"], "text": text})
+            events = self.recent()
+            active_task = active_heard_task(events)
+            task_index = next((i for i in range(len(events) - 1, -1, -1)
+                               if events[i]["role"] == "heard" and events[i]["text"] == active_task), None)
+            fact_index = next((i for i in range(len(events) - 1, -1, -1)
+                               if events[i]["role"] == "user" and is_learner_fact(events[i]["text"])), None)
+            # Речь и уточнения не должны исчезать под повторяющимися ответами ИИ.
+            priority = [(i, 800) for i in (task_index, fact_index) if i is not None]
+            drafts = [i for i in range(len(events) - 1, -1, -1)
+                      if events[i]["role"] in ("assistant", "suggestion")][:2]
+            priority += [(i, 240) for i in drafts]
+            priority += [(i, 800) for i in range(len(events) - 1, -1, -1)
+                         if events[i]["role"] in ("heard", "user")]
+            selected, remaining = {}, CONTEXT_CHAR_BUDGET
+            for index, limit in priority:
+                if index in selected or remaining <= 0:
+                    continue
+                event = events[index]
+                text = event["text"][:min(limit, remaining)]
+                selected[index] = {"role": event["role"], "text": text}
                 remaining -= len(text)
-            return self._generation, list(reversed(selected))
+            return self._generation, [selected[index] for index in sorted(selected)]
 
     def clear_memory(self):
         with self._lock, self._connect() as conn:
@@ -146,12 +172,14 @@ class ContextChat:
 
     def _answer(self, question, prompt, generation, context, on_result):
         try:
-            answer = self.assistant.answer(question, context, prompt, manual=True)
+            reply = self.assistant.reply(question, context, prompt, manual=True)
             if generation != self.workspace.snapshot()[0]:
                 result = ChatResult(question, error="Память была очищена во время запроса. Задайте вопрос заново.")
             else:
-                self.workspace.remember("assistant", answer, generation)
-                result = ChatResult(question, answer=answer)
+                self.workspace.remember("assistant", reply.text, generation, reply=reply)
+                result = ChatResult(question, answer=reply.text, translation=reply.translation,
+                                    answer_language=reply.language, translation_language=reply.target_language,
+                                    translation_error=reply.translation_error)
         except Exception as exc:
             result = ChatResult(question, error=str(exc))
         finally:
