@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from app.assistant import Assistance, AnswerSuggestion, AssistantReply
+from app.assistant import Assistance, AnswerSuggestion, AssistantReply, ReplyVariant
 from app.history_store import HistoryStore
 from app.assistant_workspace import AssistantWorkspace
 from app.pipeline import LessonPipeline
@@ -129,6 +129,17 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(self.results[-1].assistance.response_translation, "We are discussing travel.")
         self.assertEqual(self.pipeline.history.get_recent()[0].assistance.response_translation, "We are discussing travel.")
         self.assertEqual(self.pipeline.history.get_recent()[0].assistance.response, "Речь о путешествиях.")
+
+    def test_auto_reply_keeps_both_variants_in_phrase_history(self):
+        variants = [ReplyVariant("short", "Short", "Коротко", "en", "ru"),
+                    ReplyVariant("long", "A longer answer", "Длинный ответ", "en", "ru")]
+        self.pipeline.workspace.save_preferences("Мой уровень A2, дай два варианта", True)
+        self.pipeline.assistant.reply.return_value = AssistantReply("Both", "Оба", "en", "ru", variants=variants)
+        self.pipeline.set_assistant_enabled(True)
+        self.recognize()
+        self.finish_assistance()
+        self.assertEqual(self.results[-1].assistance.variants, variants)
+        self.assertEqual(self.pipeline.history.get_recent()[0].assistance.variants, variants)
 
     def test_clear_during_generation_discards_stale_answer(self):
         self.pipeline.workspace.save_preferences("Reply", True)

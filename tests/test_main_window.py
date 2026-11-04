@@ -7,7 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:
     from PySide6.QtWidgets import QApplication, QPushButton
     from app.ui.main_window import MainWindow
-    from app.assistant import Assistance, AnswerSuggestion
+    from app.assistant import Assistance, AnswerSuggestion, ReplyVariant
     from app.history_store import HistoryEntry
     from app.pipeline import PhraseResult
     from app.assistant_workspace import AssistantPreferences, ChatResult
@@ -112,6 +112,33 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(QApplication.clipboard().text(), "Меня зовут Артур.")
         self.window.copy_chat_btn.click()
         self.assertEqual(QApplication.clipboard().text(), "My name is Arthur.")
+
+    def test_short_and_long_cards_each_have_their_own_translation(self):
+        variants = [ReplyVariant("short", "Short answer", "Короткий перевод", "en", "ru"),
+                    ReplyVariant("long", "A longer answer", "Длинный перевод", "en", "ru")]
+        result = PhraseResult("Q", "В", None, 1, assistance=Assistance(variants=variants))
+        self.window._on_phrase_ready(result)
+        buttons = self.window.suggestions_widget.findChildren(QPushButton)
+        self.assertEqual(len(buttons), 4)
+        for button, expected in zip(buttons, ("Short answer", "Короткий перевод", "A longer answer", "Длинный перевод")):
+            button.click()
+            self.assertEqual(QApplication.clipboard().text(), expected)
+
+    def test_manual_chat_interleaves_each_variant_and_its_translation(self):
+        self.pipeline.workspace.recent.return_value = [{
+            "role": "assistant", "text": "Flat original", "translation": "Flat translation",
+            "variants": [
+                {"kind": "short", "text": "Short answer", "translation": "Короткий перевод", "language": "en", "target_language": "ru"},
+                {"kind": "long", "text": "A longer answer", "translation": "Длинный перевод", "language": "en", "target_language": "ru"},
+            ],
+        }]
+        self.window._load_chat()
+        text = self.window.chat_view.toPlainText()
+        self.assertIn("Короткий вариант (EN)", text)
+        self.assertIn("Развёрнутый вариант (EN)", text)
+        self.assertLess(text.index("Короткий перевод"), text.index("A longer answer"))
+        self.assertNotIn("Flat original", text)
+        self.assertNotIn("Flat translation", text)
 
     def test_history_load_newest_first(self):
         self.pipeline.history.get_recent.return_value = [

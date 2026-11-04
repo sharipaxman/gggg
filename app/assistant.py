@@ -44,10 +44,29 @@ def is_explicit_reply_request(text: str) -> bool:
 
 
 _NAME_FACT = re.compile(
-    r"^(?:мо[её]\s+имя|меня\s+зовут|my\s+name\s+is|my\s+name['’]s|i\s+am\s+called)"
-    r"\s+([a-zа-яё][a-zа-яё'-]*(?:[ -][a-zа-яё][a-zа-яё'-]*){0,2})[.!]?\s*$",
+    r"^(?:(?:мо[её]\s+)?имя|меня\s+зовут|my\s+name\s+is|my\s+name['’]s|i\s+am\s+called)"
+    r"\s*:?\s+([a-zа-яё][a-zа-яё'-]*(?:[ -][a-zа-яё][a-zа-яё'-]*){0,2})[.!]?\s*$",
     re.IGNORECASE,
 )
+_NAME_LAST = re.compile(
+    r"^([a-zа-яё][a-zа-яё'-]*(?:[ -][a-zа-яё][a-zа-яё'-]*){0,2}?)\s+(?:—\s*)?(?:мо[её]\s+)?имя[.!]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def learner_name_fact(text: str) -> str:
+    text = text.strip()
+    if "?" in text:
+        return ""
+    match = _NAME_FACT.match(text) or _NAME_LAST.match(text)
+    if not match:
+        return ""
+    name = match.group(1)
+    if name.split()[0].lower() in {"что", "как", "какое", "чье", "чьё", "это", "твое", "твоё", "мое", "моё", "what", "your"}:
+        return ""
+    return name
+
+
 _FACT_START = re.compile(
     r"^(?:мо[еёяий]\s+|меня\s+зовут\b|мне\s+\d|я\s+(?:живу|работаю|учусь|из)\b|"
     r"my\s+(?:name|age|city|job)\b|i\s+(?:live|work|study|am\s+(?:from|called|\d))\b)",
@@ -57,7 +76,7 @@ _FACT_START = re.compile(
 
 def is_learner_fact(text: str) -> bool:
     """Только явные короткие сведения пользователя, не высказывания модели."""
-    return len(text) <= 250 and "?" not in text and bool(_FACT_START.search(text.strip()))
+    return len(text) <= 250 and "?" not in text and bool(learner_name_fact(text) or _FACT_START.search(text.strip()))
 
 
 def active_heard_task(context: list[dict]) -> str:
@@ -73,7 +92,7 @@ def resolve_task(question: str, context: list[dict], manual: bool) -> dict:
     if manual and is_learner_fact(question):
         facts.append(question)
     facts = list(reversed(dict.fromkeys(reversed(facts))))[-5:]
-    name = next((match.group(1) for text in reversed(facts) if (match := _NAME_FACT.match(text.strip()))), "")
+    name = next((name for text in reversed(facts) if (name := learner_name_fact(text))), "")
     clarification = bool(manual and active_task and is_learner_fact(question))
     return {
         "task": "complete_previous_task" if clarification else ("manual_question" if manual else "heard_utterance"),
@@ -86,12 +105,56 @@ def resolve_task(question: str, context: list[dict], manual: bool) -> dict:
 
 
 @dataclass(frozen=True)
+class ReplyVariant:
+    kind: str
+    text: str
+    translation: str = ""
+    language: str = ""
+    target_language: str = ""
+    translation_error: str = ""
+
+
+VARIANT_LABELS = {"short": "Короткий вариант", "long": "Развёрнутый вариант"}
+
+
+def parse_variants(data) -> list[ReplyVariant]:
+    if data == []:
+        return []  # записи до появления двух вариантов
+    if not isinstance(data, list) or len(data) != 2:
+        raise ValueError("Должно быть ровно два варианта")
+    result = []
+    for kind, item in zip(("short", "long"), data):
+        if not isinstance(item, dict) or item.get("kind") != kind:
+            raise ValueError("Нужны короткий и развёрнутый варианты")
+        for key in ("text", "translation", "language", "target_language", "translation_error"):
+            value = item.get(key, "")
+            if not isinstance(value, str) or len(value) > 12000 or (key == "text" and not value.strip()):
+                raise ValueError("Некорректный вариант ответа")
+        result.append(ReplyVariant(kind=kind, **{key: item.get(key, "") for key in (
+            "text", "translation", "language", "target_language", "translation_error",
+        )}))
+    return result
+
+
+A2_POLICY = """The learner's MAXIMUM English level is CEFR A2. This overrides harder style requests.
+Use common everyday words, short sentences, simple present/past/future, no advanced
+idioms, academic words, complex clauses or passive voice where simple active speech works.
+Say 'People are not sure' instead of 'its origin is uncertain/debated'; avoid 'etymology',
+'significance', 'associated with'. Proper names are fine. Keep the meaning useful and specific:
+include relevant concrete details, not generic filler about many cultures or centuries.
+Use general knowledge carefully; do not invent personal/family facts or state disputed
+name origins as certain. Explain uncertainty in SIMPLE words, then add known useful details.
+"""
+
+
+@dataclass(frozen=True)
 class AssistantReply:
     text: str
     translation: str = ""
     language: str = ""
     target_language: str = ""
     translation_error: str = ""
+    variants: list[ReplyVariant] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -109,6 +172,7 @@ class Assistance:
     response_language: str = ""
     translation_language: str = ""
     translation_error: str = ""
+    variants: list[ReplyVariant] = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -140,13 +204,14 @@ class Assistance:
         )}
         if any(not isinstance(value, str) or len(value) > 12000 for value in extra.values()):
             raise ValueError("Некорректный перевод ответа")
-        return cls(data["is_question"], result if data["is_question"] else [], response, **extra)
+        return cls(data["is_question"], result if data["is_question"] else [], response,
+                   **extra, variants=parse_variants(data.get("variants", [])))
 
     @classmethod
     def from_reply(cls, reply: AssistantReply) -> Assistance:
         return cls(response=reply.text, response_translation=reply.translation,
                    response_language=reply.language, translation_language=reply.target_language,
-                   translation_error=reply.translation_error)
+                   translation_error=reply.translation_error, variants=reply.variants)
 
 
 RESPONSE_SCHEMA = {
@@ -174,7 +239,8 @@ Questions AND requests/invitations to speak require replies, even without '?':
 If current.reply_required=true, you MUST set is_question=true and give replies.
 For a plain statement set is_question=false, suggestions=[].
 When a reply is needed, give exactly TWO different possible spoken replies.
-Each has en (English) and ru (same meaning in Russian), at most 15 words each.
+Each has en (English) and ru (same meaning in Russian). The FIRST is short
+(1-2 sentences), the SECOND is longer (3-5 simple sentences) and adds useful detail.
 Do not give instructions ABOUT answering; give actual sample replies.
 Never invent the learner's name, biography or name etymology as known facts.
 If personal facts are missing, offer an honest uncertainty/clarification reply
@@ -223,7 +289,7 @@ class ConversationAssistant:
             "model": self.model, "stream": False, "format": schema,
             "keep_alive": ASSISTANT_KEEP_ALIVE,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT + ("\nLearner preferences:\n" + custom_prompt if custom_prompt else "")},
+                {"role": "system", "content": SYSTEM_PROMPT + ("\nLearner preferences:\n" + custom_prompt if custom_prompt else "") + "\n" + A2_POLICY},
                 {"role": "user", "content": json.dumps(transcript, ensure_ascii=False)},
             ],
             "options": {"temperature": 0.2, "num_predict": ASSISTANT_NUM_PREDICT,
@@ -232,31 +298,41 @@ class ConversationAssistant:
         try:
             envelope = self._request(payload)
             result = Assistance.from_json(envelope["message"]["content"])
-            if reply_required and (not result.is_question or len(result.suggestions) != 2):
-                raise ValueError("ИИ не вернул два ответа на явную просьбу")
+            if (reply_required and not result.is_question) or (result.is_question and len(result.suggestions) != 2):
+                raise ValueError("ИИ не вернул два ответа на вопрос или просьбу")
             return result
         except (ValueError, KeyError, TypeError) as exc:
             raise RuntimeError("Некорректный ответ ИИ. Попробуйте другую модель Ollama.") from exc
 
     def answer(self, question: str, context: list[dict], prompt: str, manual: bool = False) -> str:
-        """Текстовый API для совместимости. Интерфейс использует reply с отдельным переводом."""
-        return self._answer_text(question, context, prompt, manual)[0]
+        """Текстовый API для совместимости. Интерфейс использует reply с двумя вариантами."""
+        return self._answer_data(question, context, prompt, manual)["answer"]
 
     def reply(self, question: str, context: list[dict], prompt: str, manual: bool = False) -> AssistantReply:
-        text, language = self._answer_text(question, context, prompt, manual, with_language=True)
+        data = self._answer_data(question, context, prompt, manual, with_variants=True)
+        language = data["answer_language"]
         target = target_language(language)
-        try:
-            translation = self._translator.translate(text, language, target)
-            if not translation.strip():
-                raise RuntimeError("Переводчик вернул пустой ответ")
-            return AssistantReply(text, translation, language, target)
-        except Exception as exc:
-            # Ошибка языкового пакета не должна уничтожать уже полученную подсказку.
-            logger.warning("Не удалось перевести ответ ИИ: %s", exc)
-            return AssistantReply(text, language=language, target_language=target, translation_error=str(exc))
+        variants = []
+        for kind, key in (("short", "short_answer"), ("long", "long_answer")):
+            text = data[key]
+            try:
+                translation = self._translator.translate(text, language, target)
+                if not translation.strip():
+                    raise RuntimeError("Переводчик вернул пустой ответ")
+                variants.append(ReplyVariant(kind, text, translation, language, target))
+            except Exception as exc:
+                logger.warning("Не удалось перевести %s вариант ИИ: %s", kind, exc)
+                variants.append(ReplyVariant(kind, text, language=language, target_language=target,
+                                             translation_error=str(exc)))
+        # Плоские поля оставляем для старых потребителей, копирования обоих ответов
+        # и памяти. Интерфейс рисует каждый вариант и его перевод отдельно.
+        text = "\n\n".join(f"{VARIANT_LABELS[v.kind]}:\n{v.text}" for v in variants)
+        translation = "\n\n".join(f"{VARIANT_LABELS[v.kind]}:\n{v.translation}" for v in variants if v.translation)
+        errors = "; ".join(f"{VARIANT_LABELS[v.kind]}: {v.translation_error}" for v in variants if v.translation_error)
+        return AssistantReply(text, translation, language, target, errors, variants)
 
-    def _answer_text(self, question: str, context: list[dict], prompt: str,
-                     manual: bool, with_language: bool = False) -> tuple[str, str]:
+    def _answer_data(self, question: str, context: list[dict], prompt: str,
+                     manual: bool, with_variants: bool = False) -> dict:
         task = resolve_task(question, context, manual)
         system = (
             "You help a learner respond to a teacher. Follow the saved user instructions. "
@@ -281,14 +357,32 @@ class ConversationAssistant:
         )
         schema = {"type": "object", "properties": {"answer": {"type": "string"}},
                   "required": ["answer"], "additionalProperties": False}
-        if with_language:
-            schema["properties"]["answer_language"] = {"type": "string", "enum": ["en", "ru"]}
-            schema["required"].append("answer_language")
+        system += "\n" + A2_POLICY
+        if with_variants:
+            schema = {
+                "type": "object",
+                "properties": {
+                    "short_answer": {"type": "string"},
+                    "long_answer": {"type": "string"},
+                    "answer_language": {"type": "string", "enum": ["en", "ru"]},
+                },
+                "required": ["short_answer", "long_answer", "answer_language"],
+                "additionalProperties": False,
+            }
             system += (
-                "\nOUTPUT CONTRACT: answer must contain ONE language only (en or ru). Set "
-                "answer_language accordingly. Translation is added separately by the application. "
-                "For bilingual requests, write only the English original; do not include the "
-                "Russian translation inside answer. This contract overrides formatting preferences."
+                "\nOUTPUT CONTRACT: ALWAYS give exactly TWO useful answers to the SAME task. "
+                "short_answer: 1-2 simple sentences, usually 15-30 words. "
+                "long_answer: 3-5 simple sentences, usually 40-70 words, LONGER than short_answer. "
+                "The longer version must add concrete relevant information, not repeat the short one "
+                "or just say the origin is unknown. For a name, add known details such as "
+                "a well-known person or story connected with it, without claiming that this "
+                "proves its first origin. If no reliable detail is known, say so; never invent one. "
+                "Both must be ready to say, at A2 maximum. "
+                "This two-answer structure applies to manual chat AND heard speech, regardless of "
+                "whether the saved prompt mentions the number of variants. "
+                "Use ONE language only (en or ru) and set answer_language. Translation for EACH "
+                "variant is added separately. For bilingual requests write only the English originals. "
+                "Never mix translations into the originals. This contract overrides conflicting formats."
             )
         messages = [{"role": "system", "content": system}]
         for event in context:
@@ -309,15 +403,24 @@ class ConversationAssistant:
         try:
             envelope = self._request(payload)
             data = json.loads(envelope["message"]["content"])
-            answer = data["answer"]
-            if not isinstance(answer, str) or not answer.strip() or len(answer) > 12000:
-                raise ValueError("Пустой или слишком длинный ответ")
-            language = data.get("answer_language", "")
-            if with_language and language not in ("en", "ru"):
-                raise ValueError("ИИ не указал язык ответа")
-            return answer.strip(), language
+            keys = ("short_answer", "long_answer") if with_variants else ("answer",)
+            for key in keys:
+                answer = data[key]
+                if not isinstance(answer, str) or not answer.strip() or len(answer) > (4000 if with_variants else 12000):
+                    raise ValueError("Пустой или слишком длинный ответ")
+                data[key] = answer.strip()
+            if with_variants:
+                if data.get("answer_language") not in ("en", "ru"):
+                    raise ValueError("ИИ не указал язык ответа")
+                if data["short_answer"].casefold() == data["long_answer"].casefold():
+                    raise ValueError("ИИ повторил один вариант дважды")
+                if len(data["long_answer"].split()) <= len(data["short_answer"].split()):
+                    raise ValueError("Развёрнутый вариант должен быть длиннее короткого")
+            return data
         except (ValueError, KeyError, TypeError) as exc:
-            raise RuntimeError("ИИ вернул некорректный или пустой ответ") from exc
+            message = ("ИИ не вернул два разных варианта: короткий и развёрнутый. Повторите запрос."
+                       if with_variants else "ИИ вернул некорректный или пустой ответ")
+            raise RuntimeError(message) from exc
 
     def _request(self, payload: dict) -> dict:
         request = Request(self.url, data=json.dumps(payload).encode("utf-8"),

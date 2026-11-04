@@ -2,10 +2,10 @@
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 from urllib.error import HTTPError, URLError
 
-from app.assistant import Assistance, AnswerSuggestion, ConversationAssistant, is_explicit_reply_request, RESPONSE_SCHEMA, AssistantReply, resolve_task
+from app.assistant import Assistance, AnswerSuggestion, ConversationAssistant, is_explicit_reply_request, RESPONSE_SCHEMA, AssistantReply, resolve_task, ReplyVariant, parse_variants, learner_name_fact
 from app.config import ASSISTANT_CONTEXT_ENTRIES, ASSISTANT_MAX_TEXT_CHARS
 
 
@@ -13,7 +13,8 @@ class AssistantTests(unittest.TestCase):
     def setUp(self):
         self.client = ConversationAssistant()
         self.client._opener = MagicMock()
-        self.answer = Assistance(True, [AnswerSuggestion("I like reading.", "Я люблю читать.")])
+        self.answer = Assistance(True, [AnswerSuggestion("I like reading.", "Я люблю читать."),
+                                        AnswerSuggestion("I like reading books. I often read at home.", "Я люблю читать книги. Я часто читаю дома.")])
 
     def respond(self, content):
         response = self.client._opener.open.return_value.__enter__.return_value
@@ -113,7 +114,9 @@ class AssistantTests(unittest.TestCase):
                    {"role": "user", "text": "мое имя артур"}, {"role": "assistant", "text": generic}]
         self.client._translator = MagicMock()
         self.client._translator.translate.return_value = "Меня зовут Артур. Точное происхождение имени спорно."
-        self.respond('{"answer":"My name is Arthur. Its exact origin is debated.","answer_language":"en"}')
+        short = "My name is Arthur. People know this name from stories about King Arthur."
+        long = "My name is Arthur. It is an old name. Many people know it from stories about King Arthur. People are not sure where the name first came from."
+        self.respond(json.dumps({"short_answer": short, "long_answer": long, "answer_language": "en"}))
         reply = self.client.reply("мое имя артур", context, "Помоги мне ответить преподавателю", manual=True)
         body = json.loads(self.client._opener.open.call_args.args[0].data)
         request = json.loads(body["messages"][-1]["content"])
@@ -127,8 +130,9 @@ class AssistantTests(unittest.TestCase):
         self.assertIn("Do not ask for the name again", body["messages"][0]["content"])
         self.assertIn("uncertain", body["messages"][0]["content"])
         self.assertIn("answer_language", body["format"]["required"])
-        self.client._translator.translate.assert_called_once_with(reply.text, "en", "ru")
-        self.assertEqual(reply.translation, "Меня зовут Артур. Точное происхождение имени спорно.")
+        self.client._translator.translate.assert_has_calls([call(short, "en", "ru"), call(long, "en", "ru")])
+        self.assertEqual(reply.variants[0].translation, "Меня зовут Артур. Точное происхождение имени спорно.")
+        self.assertEqual([v.kind for v in reply.variants], ["short", "long"])
         self.assertEqual(reply.language, "en")
         self.assertEqual(Assistance.from_json(Assistance.from_reply(reply).to_json()), Assistance.from_reply(reply))
 
@@ -168,28 +172,99 @@ class AssistantTests(unittest.TestCase):
     def test_translation_direction_ru_to_en_and_separate_output(self):
         self.client._translator = MagicMock()
         self.client._translator.translate.return_value = "My name is Arthur."
-        self.respond('{"answer":"Меня зовут Артур.","answer_language":"ru"}')
+        self.respond('{"short_answer":"Меня зовут Артур.","long_answer":"Меня зовут Артур. Это старое имя, известное по историям о короле Артуре.","answer_language":"ru"}')
         reply = self.client.reply("Q", [], "Отвечай на русском")
-        self.client._translator.translate.assert_called_once_with("Меня зовут Артур.", "ru", "en")
-        self.assertEqual(reply.translation, "My name is Arthur.")
+        self.client._translator.translate.assert_any_call("Меня зовут Артур.", "ru", "en")
+        self.assertEqual(self.client._translator.translate.call_count, 2)
+        self.assertEqual(reply.variants[0].translation, "My name is Arthur.")
 
     def test_translation_failure_preserves_original_answer(self):
         self.client._translator = MagicMock()
         self.client._translator.translate.side_effect = RuntimeError("Пакет en→ru не установлен")
-        self.respond('{"answer":"My name is Arthur.","answer_language":"en"}')
+        self.respond('{"short_answer":"My name is Arthur.","long_answer":"My name is Arthur. It is an old name.","answer_language":"en"}')
         with self.assertLogs("app.assistant", level="WARNING"):
             reply = self.client.reply("Q", [], "")
-        self.assertEqual(reply.text, "My name is Arthur.")
+        self.assertEqual(reply.variants[0].text, "My name is Arthur.")
+        self.assertEqual(len(reply.variants), 2)
         self.assertEqual(reply.translation, "")
         self.assertIn("Пакет", reply.translation_error)
 
     def test_invalid_reply_language_is_not_sent_to_translator(self):
         self.client._translator = MagicMock()
         for language in (None, "de"):
-            self.respond(json.dumps({"answer": "Answer", "answer_language": language}))
+            self.respond(json.dumps({"short_answer": "Answer", "long_answer": "A longer answer with details.", "answer_language": language}))
             with self.assertRaises(RuntimeError):
                 self.client.reply("Q", [], "")
         self.client._translator.translate.assert_not_called()
+
+    def test_two_variants_and_a2_contract_apply_even_to_existing_custom_prompts(self):
+        self.client._translator = MagicMock()
+        self.client._translator.translate.side_effect = ["Короткий перевод", "Длинный перевод"]
+        self.respond(json.dumps({
+            "short_answer": "My name is Arthur.",
+            "long_answer": "My name is Arthur. People know this name from old stories about King Arthur.",
+            "answer_language": "en",
+        }))
+        reply = self.client.reply("артур имя", [{"role": "heard", "text": "Tell me about the origin of your name."}],
+                                  "Дай два варианта, по длиннее и по короче", manual=True)
+        body = json.loads(self.client._opener.open.call_args.args[0].data)
+        self.assertEqual(set(body["format"]["required"]), {"short_answer", "long_answer", "answer_language"})
+        self.assertFalse(body["format"]["additionalProperties"])
+        self.assertIn("MAXIMUM English level is CEFR A2", body["messages"][0]["content"])
+        self.assertIn("short sentences", body["messages"][0]["content"])
+        self.assertIn("concrete relevant information", body["messages"][0]["content"])
+        self.assertIn("uncertainty in SIMPLE words", body["messages"][0]["content"])
+        task = json.loads(body["messages"][-1]["content"])
+        self.assertEqual(task["task"], "complete_previous_task")
+        self.assertEqual(task["learner_name"], "артур")
+        self.assertEqual([v.translation for v in reply.variants], ["Короткий перевод", "Длинный перевод"])
+        self.assertGreater(len(reply.variants[1].text.split()), len(reply.variants[0].text.split()))
+        self.client._opener.open.assert_called_once()  # два варианта за один запрос модели
+
+    def test_single_duplicate_or_non_longer_variant_is_rejected(self):
+        self.client._translator = MagicMock()
+        bad = [
+            {"answer": "Only one answer", "answer_language": "en"},
+            {"short_answer": "Short answer", "long_answer": "", "answer_language": "en"},
+            {"short_answer": "Same answer", "long_answer": "Same answer", "answer_language": "en"},
+            {"short_answer": "This is the short answer", "long_answer": "Shorter", "answer_language": "en"},
+        ]
+        for response in bad:
+            with self.subTest(response=response):
+                self.respond(json.dumps(response))
+                with self.assertRaisesRegex(RuntimeError, "короткий и развёрнутый"):
+                    self.client.reply("Q", [], "")
+        self.client._translator.translate.assert_not_called()
+
+    def test_one_translation_error_does_not_hide_the_other_variant(self):
+        self.client._translator = MagicMock()
+        self.client._translator.translate.side_effect = [RuntimeError("missing model"), "Длинный перевод"]
+        self.respond('{"short_answer":"Short answer.","long_answer":"A longer answer with useful details.","answer_language":"en"}')
+        with self.assertLogs("app.assistant", level="WARNING"):
+            reply = self.client.reply("Q", [], "")
+        self.assertIn("missing model", reply.variants[0].translation_error)
+        self.assertEqual(reply.variants[1].translation, "Длинный перевод")
+        self.assertEqual(len(reply.variants), 2)
+
+    def test_name_shorthand_and_questions_are_not_confused(self):
+        for text in ("артур имя", "Артур моё имя", "имя Артур", "имя: Артур"):
+            with self.subTest(text=text):
+                self.assertEqual(learner_name_fact(text).casefold(), "артур")
+        for text in ("какое имя", "что значит имя", "твое имя?", "что имя значит"):
+            with self.subTest(text=text):
+                self.assertEqual(learner_name_fact(text), "")
+
+    def test_variant_json_is_strict_but_old_records_remain_readable(self):
+        self.assertEqual(parse_variants([]), [])
+        for invalid in (None, {}, [{"kind": "short", "text": "Only one"}],
+                        [{"kind": "long", "text": "L"}, {"kind": "short", "text": "S"}]):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                parse_variants(invalid)
+
+    def test_legacy_question_mode_also_requires_two_variants(self):
+        self.respond('{"is_question":true,"suggestions":[{"en":"Only one","ru":"Только один"}]}')
+        with self.assertRaises(RuntimeError):
+            self.client.suggest("What do you like?", "Что тебе нравится?", "en", [])
 
     def test_statement_has_no_answers(self):
         self.respond('{"is_question":false,"suggestions":[]}')

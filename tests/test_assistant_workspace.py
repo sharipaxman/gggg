@@ -11,7 +11,7 @@ from app.assistant_workspace import (
     PROMPT_MAX_CHARS, QUESTION_MAX_CHARS,
 )
 from app.history_store import HistoryStore
-from app.assistant import AssistantReply
+from app.assistant import AssistantReply, ReplyVariant
 
 
 class WorkspaceTests(unittest.TestCase):
@@ -104,6 +104,18 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(reopened.recent()[-1]["translation"], "Новый ответ")
         self.assertEqual(reopened.recent()[-1]["answer_language"], "en")
 
+    def test_two_variants_with_individual_translations_survive_restart(self):
+        variants = [ReplyVariant("short", "My name is Arthur.", "Меня зовут Артур.", "en", "ru"),
+                    ReplyVariant("long", "My name is Arthur. It is an old name.",
+                                 "Меня зовут Артур. Это старое имя.", "en", "ru")]
+        reply = AssistantReply("Both answers", "Оба перевода", "en", "ru", variants=variants)
+        self.workspace.remember("assistant", reply.text, reply=reply)
+        event = AssistantWorkspace(self.path).recent(chat_only=True)[0]
+        self.assertEqual([v["kind"] for v in event["variants"]], ["short", "long"])
+        self.assertEqual([v["translation"] for v in event["variants"]],
+                         ["Меня зовут Артур.", "Меня зовут Артур. Это старое имя."])
+        self.assertEqual(event["text"], "Both answers")
+
 
 class ContextChatTests(unittest.TestCase):
     def setUp(self):
@@ -136,6 +148,14 @@ class ContextChatTests(unittest.TestCase):
         reopened = AssistantWorkspace(self.path)
         self.assertEqual([e["role"] for e in reopened.recent()], ["heard", "user", "assistant"])
         self.assertEqual(reopened.recent()[-1]["translation"], "Вы обсуждали Париж.")
+
+    def test_manual_result_contains_both_variants_and_their_translations(self):
+        variants = [ReplyVariant("short", "Short", "Коротко", "en", "ru"),
+                    ReplyVariant("long", "A longer answer", "Развёрнутый ответ", "en", "ru")]
+        self.assistant.reply.return_value = AssistantReply("Both", "Оба", "en", "ru", variants=variants)
+        result = self.run_question("артур имя")
+        self.assertEqual(result.variants, variants)
+        self.assertEqual(self.workspace.recent(chat_only=True)[-1]["variants"][1]["translation"], "Развёрнутый ответ")
 
     def test_followup_contains_previous_user_question_and_answer(self):
         self.run_question("Which city?")

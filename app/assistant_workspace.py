@@ -4,19 +4,22 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
 from app.config import DB_PATH
-from app.assistant import AssistantReply, active_heard_task, is_learner_fact
+from app.assistant import AssistantReply, ReplyVariant, active_heard_task, is_learner_fact
 
 DEFAULT_PROMPT = (
-    "Ты мой помощник на уроке английского. Учитывай контекст разговора. "
-    "На каждую новую реплику дай короткий полезный ответ: предложи, что можно сказать "
-    "на английском, и рядом русский перевод. Если я задаю вопрос вручную, ответь на него "
-    "по контексту. Не выдумывай мои личные данные; если сведений нет, прямо скажи об этом."
+    "Ты мой помощник на уроке английского. Мой уровень — максимум A2. "
+    "Учитывай контекст и предлагай два готовых ответа: короткий (1–2 простых предложения) "
+    "и развёрнутый (3–5 простых предложений с полезными подробностями). "
+    "Используй обычные слова без сложных оборотов. К каждому варианту нужен русский перевод. "
+    "Если я уточняю личные данные, примени их к предыдущему заданию. "
+    "На ручной вопрос отвечай по контексту. Не выдумывай мои личные данные; "
+    "неопределённость объясняй просто, не заменяя ею весь ответ."
 )
 PROMPT_MAX_CHARS = 1500
 QUESTION_MAX_CHARS = 1000
@@ -39,6 +42,7 @@ class ChatResult:
     answer_language: str = ""
     translation_language: str = ""
     translation_error: str = ""
+    variants: list[ReplyVariant] = field(default_factory=list)
 
 
 class AssistantWorkspace:
@@ -62,6 +66,8 @@ class AssistantWorkspace:
             for name in ("translation", "answer_language", "translation_language", "translation_error"):
                 if name not in columns:
                     conn.execute(f"ALTER TABLE assistant_memory ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+            if "variants_json" not in columns:
+                conn.execute("ALTER TABLE assistant_memory ADD COLUMN variants_json TEXT NOT NULL DEFAULT '[]'")
             # Подхватываем старую историю один раз, но не после очистки памяти.
             if not exists and conn.execute("SELECT 1 FROM sqlite_master WHERE name='phrases'").fetchone():
                 conn.execute("""INSERT INTO assistant_memory (created_at, role, text)
@@ -95,19 +101,25 @@ class AssistantWorkspace:
             if generation is not None and generation != self._generation:
                 return
             conn.execute("INSERT INTO assistant_memory "
-                         "(created_at, role, text, translation, answer_language, translation_language, translation_error) "
-                         "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                         "(created_at, role, text, translation, answer_language, translation_language, translation_error, variants_json) "
+                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                          (datetime.now().isoformat(timespec="seconds"), role, text,
                           reply.translation if reply else "", reply.language if reply else "",
-                          reply.target_language if reply else "", reply.translation_error if reply else ""))
+                          reply.target_language if reply else "", reply.translation_error if reply else "",
+                          json.dumps([asdict(v) for v in reply.variants], ensure_ascii=False) if reply else "[]"))
             conn.execute("DELETE FROM assistant_memory WHERE id NOT IN "
                          "(SELECT id FROM assistant_memory ORDER BY id DESC LIMIT ?)", (MEMORY_LIMIT,))
 
     def recent(self, chat_only: bool = False) -> list[dict]:
         where = "WHERE role IN ('user', 'assistant')" if chat_only else ""
         with self._lock, self._connect() as conn:
-            rows = conn.execute(f"SELECT role, text, created_at, translation, answer_language, translation_language, translation_error FROM assistant_memory {where} ORDER BY id").fetchall()
-        return [dict(row) for row in rows]
+            rows = conn.execute(f"SELECT role, text, created_at, translation, answer_language, translation_language, translation_error, variants_json FROM assistant_memory {where} ORDER BY id").fetchall()
+        events = []
+        for row in rows:
+            event = dict(row)
+            event["variants"] = json.loads(event.pop("variants_json"))
+            events.append(event)
+        return events
 
     def snapshot(self) -> tuple[int, list[dict]]:
         """Свежие события в хронологическом порядке, с ограниченным размером."""
@@ -179,7 +191,7 @@ class ContextChat:
                 self.workspace.remember("assistant", reply.text, generation, reply=reply)
                 result = ChatResult(question, answer=reply.text, translation=reply.translation,
                                     answer_language=reply.language, translation_language=reply.target_language,
-                                    translation_error=reply.translation_error)
+                                    translation_error=reply.translation_error, variants=reply.variants)
         except Exception as exc:
             result = ChatResult(question, error=str(exc))
         finally:

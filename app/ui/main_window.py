@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.pipeline import LessonPipeline, PhraseResult
-from app.assistant import Assistance
+from app.assistant import Assistance, VARIANT_LABELS, parse_variants
 from app.assistant_workspace import PROMPT_MAX_CHARS, QUESTION_MAX_CHARS, MEMORY_LIMIT, CONTEXT_CHAR_BUDGET
 from app.hotkey_manager import HotkeyManager
 from app.history_store import HistoryEntry
@@ -59,32 +59,59 @@ class SuggestionsWidget(QWidget):
             label.setWordWrap(True)
             label.setStyleSheet("color: #aab8cf; font-size: 12px;")
             self.rows.addWidget(label)
-        if assistance.response:
-            prefix = f"Ответ ИИ ({assistance.response_language.upper()}):\n" if assistance.response_language else ""
-            label = QLabel(prefix + assistance.response)
-            label.setTextFormat(Qt.PlainText)
-            label.setWordWrap(True)
-            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            label.setStyleSheet("color: #d1e8db; font-size: 14px;")
-            self.rows.addWidget(label)
-            copy = QPushButton("Копировать ответ ИИ")
-            copy.clicked.connect(lambda: QApplication.clipboard().setText(assistance.response))
-            self.rows.addWidget(copy)
-        if assistance.response_translation:
-            label = QLabel(f"Перевод ({assistance.translation_language.upper()}):\n{assistance.response_translation}")
-            label.setTextFormat(Qt.PlainText)
-            label.setWordWrap(True)
-            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            label.setStyleSheet("color: #b7c2d0; font-size: 14px;")
-            self.rows.addWidget(label)
-            copy = QPushButton("Копировать перевод подсказки")
-            copy.clicked.connect(lambda: QApplication.clipboard().setText(assistance.response_translation))
-            self.rows.addWidget(copy)
-        if assistance.translation_error:
-            warning = QLabel(f"Перевод подсказки недоступен: {assistance.translation_error}")
-            warning.setTextFormat(Qt.PlainText)
-            warning.setWordWrap(True)
-            self.rows.addWidget(warning)
+        if assistance.variants:
+            for variant in assistance.variants:
+                card = QWidget()
+                layout = QVBoxLayout(card)
+                title = QLabel(f"{VARIANT_LABELS[variant.kind]} • A2")
+                title.setStyleSheet("color: #d1e8db; font-weight: 600;")
+                layout.addWidget(title)
+                for caption, language, value in (("Ответ", variant.language, variant.text),
+                                                 ("Перевод", variant.target_language, variant.translation)):
+                    if not value:
+                        continue
+                    label = QLabel(f"{caption} ({language.upper()}):\n{value}")
+                    label.setTextFormat(Qt.PlainText)
+                    label.setWordWrap(True)
+                    label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                    label.setStyleSheet("color: #d1e8db; font-size: 14px;")
+                    layout.addWidget(label)
+                    copy = QPushButton(f"Копировать {caption.lower()} {language.upper()}")
+                    copy.clicked.connect(lambda checked=False, text=value: QApplication.clipboard().setText(text))
+                    layout.addWidget(copy)
+                if variant.translation_error:
+                    warning = QLabel(f"Перевод недоступен: {variant.translation_error}")
+                    warning.setTextFormat(Qt.PlainText)
+                    warning.setWordWrap(True)
+                    layout.addWidget(warning)
+                self.rows.addWidget(card)
+        else:
+            if assistance.response:
+                prefix = f"Ответ ИИ ({assistance.response_language.upper()}):\n" if assistance.response_language else ""
+                label = QLabel(prefix + assistance.response)
+                label.setTextFormat(Qt.PlainText)
+                label.setWordWrap(True)
+                label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                label.setStyleSheet("color: #d1e8db; font-size: 14px;")
+                self.rows.addWidget(label)
+                copy = QPushButton("Копировать ответ ИИ")
+                copy.clicked.connect(lambda: QApplication.clipboard().setText(assistance.response))
+                self.rows.addWidget(copy)
+            if assistance.response_translation:
+                label = QLabel(f"Перевод ({assistance.translation_language.upper()}):\n{assistance.response_translation}")
+                label.setTextFormat(Qt.PlainText)
+                label.setWordWrap(True)
+                label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                label.setStyleSheet("color: #b7c2d0; font-size: 14px;")
+                self.rows.addWidget(label)
+                copy = QPushButton("Копировать перевод подсказки")
+                copy.clicked.connect(lambda: QApplication.clipboard().setText(assistance.response_translation))
+                self.rows.addWidget(copy)
+            if assistance.translation_error:
+                warning = QLabel(f"Перевод подсказки недоступен: {assistance.translation_error}")
+                warning.setTextFormat(Qt.PlainText)
+                warning.setWordWrap(True)
+                self.rows.addWidget(warning)
         for index, answer in enumerate(assistance.suggestions, 1):
             card = QWidget()
             layout = QVBoxLayout(card)
@@ -138,7 +165,7 @@ class HistoryItemWidget(QFrame):
         row.addWidget(copy_btn)
         layout.addLayout(row)
 
-        if entry.assistance.suggestions or entry.assistance.response:
+        if entry.assistance.suggestions or entry.assistance.response or entry.assistance.variants:
             answers = SuggestionsWidget()
             answers.show_assistance(entry.assistance, "Ответ ИИ" if entry.assistance.response else "Возможные ответы (примеры)")
             layout.addWidget(answers)
@@ -298,6 +325,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         preferences = self.pipeline.workspace.preferences()
         layout.addWidget(self._section_label(f"Инструкция ИИ (до {PROMPT_MAX_CHARS} символов)"))
+        layout.addWidget(QLabel("Ответы: короткий + развёрнутый • максимум A2 • перевод каждого"))
         self.prompt_edit = QPlainTextEdit()
         self.prompt_edit.setPlaceholderText("Например: объясняй новые слова; отвечай кратко по-русски…")
         self.prompt_edit.setPlainText(preferences.prompt)
@@ -370,11 +398,21 @@ class MainWindow(QMainWindow):
         events = self.pipeline.workspace.recent(chat_only=True)
         blocks = []
         for event in events:
-            blocks.append(f"{'Вы' if event['role'] == 'user' else 'ИИ'}: {event['text']}")
-            if event.get("translation"):
-                blocks.append(f"Перевод ({event.get('translation_language', '').upper()}): {event['translation']}")
-            if event.get("translation_error"):
-                blocks.append(f"Перевод недоступен: {event['translation_error']}")
+            variants = parse_variants(event.get("variants", []))
+            if event["role"] == "assistant" and variants:
+                blocks.append("ИИ • два варианта • A2")
+                for variant in variants:
+                    blocks.append(f"{VARIANT_LABELS[variant.kind]} ({variant.language.upper()}):\n{variant.text}")
+                    if variant.translation:
+                        blocks.append(f"Перевод ({variant.target_language.upper()}):\n{variant.translation}")
+                    if variant.translation_error:
+                        blocks.append(f"Перевод недоступен: {variant.translation_error}")
+            else:
+                blocks.append(f"{'Вы' if event['role'] == 'user' else 'ИИ'}: {event['text']}")
+                if event.get("translation"):
+                    blocks.append(f"Перевод ({event.get('translation_language', '').upper()}): {event['translation']}")
+                if event.get("translation_error"):
+                    blocks.append(f"Перевод недоступен: {event['translation_error']}")
         self.chat_view.setPlainText("\n\n".join(blocks))
         answers = [event for event in events if event["role"] == "assistant"]
         self._last_chat_answer = answers[-1]["text"] if answers else ""
