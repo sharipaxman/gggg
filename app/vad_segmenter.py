@@ -35,6 +35,7 @@ VAD-сегментатор на Silero VAD: главная логика "дож�
 from __future__ import annotations
 
 import logging
+import math
 import queue
 import threading
 from dataclasses import dataclass
@@ -139,7 +140,8 @@ class VadSegmenter:
         self._frames_per_ms = SAMPLE_RATE / 1000
         # Silero принимает строго 512 сэмплов на 16 кГц (256 на 8 кГц)
         self._frame_samples = VAD_WINDOW_SAMPLES
-        self._silence_frames_needed = max(1, int(END_OF_SPEECH_SILENCE_MS / FRAME_MS))
+        # Округляем вверх: при 32 мс 1500 мс требуют 47 окон (=1504 мс), не 46.
+        self._silence_frames_needed = max(1, math.ceil(END_OF_SPEECH_SILENCE_MS / FRAME_MS))
         self._min_speech_frames = max(1, int(MIN_UTTERANCE_MS / FRAME_MS))
         self._max_speech_frames = max(1, int(MAX_UTTERANCE_MS / FRAME_MS))
         self._pre_pad_frames = max(0, int(PRE_SPEECH_PADDING_MS / FRAME_MS))

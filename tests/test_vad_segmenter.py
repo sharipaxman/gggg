@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import sys
+import math
 import unittest
 from pathlib import Path
 
@@ -29,7 +30,7 @@ from app.config import (  # noqa: E402
 )
 from app.vad_segmenter import VadSegmenter, Utterance  # noqa: E402
 
-SILENCE_FRAMES = max(1, int(END_OF_SPEECH_SILENCE_MS / FRAME_MS))
+SILENCE_FRAMES = max(1, math.ceil(END_OF_SPEECH_SILENCE_MS / FRAME_MS))
 MIN_SPEECH_FRAMES = max(1, int(MIN_UTTERANCE_MS / FRAME_MS))
 MAX_SPEECH_FRAMES = max(1, int(MAX_UTTERANCE_MS / FRAME_MS))
 

@@ -10,6 +10,7 @@ try:
     from app.assistant import Assistance, AnswerSuggestion, ReplyVariant
     from app.history_store import HistoryEntry
     from app.pipeline import PhraseResult
+    from app.window_privacy import CaptureProtectionResult
     from app.assistant_workspace import AssistantPreferences, ChatResult
     QT_AVAILABLE = True
 except ImportError:
@@ -23,6 +24,9 @@ class MainWindowTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self):
+        self.privacy_support_patch = patch("app.ui.main_window.capture_protection_support", return_value=(True, "Supported"))
+        self.privacy_support_patch.start()
+        self.addCleanup(self.privacy_support_patch.stop)
         self.pipeline_patch = patch("app.ui.main_window.LessonPipeline")
         self.hotkeys_patch = patch("app.ui.main_window.HotkeyManager")
         self.pipeline_factory = self.pipeline_patch.start()
@@ -41,6 +45,36 @@ class MainWindowTests(unittest.TestCase):
         self.assertFalse(self.window.assistant_checkbox.isChecked())
         self.window.assistant_checkbox.setChecked(True)
         self.pipeline.set_assistant_enabled.assert_called_once_with(True)
+
+    def test_capture_exclusion_is_opt_in(self):
+        self.assertFalse(self.window.capture_exclusion_checkbox.isChecked())
+        self.assertFalse(self.window._capture_exclusion_requested)
+
+    def test_capture_checkbox_applies_and_removes_native_exclusion(self):
+        def result(hwnd, enabled):
+            return CaptureProtectionResult(True, enabled, "Accepted")
+
+        with patch("app.ui.main_window.set_capture_exclusion", side_effect=result) as native:
+            self.window.capture_exclusion_checkbox.setChecked(True)
+            self.assertTrue(self.window._capture_exclusion_requested)
+            self.assertEqual(native.call_args.args[1], True)
+            self.assertGreater(native.call_args.args[0], 0)
+            self.window.capture_exclusion_checkbox.setChecked(False)
+            self.assertFalse(self.window._capture_exclusion_requested)
+            self.assertEqual(native.call_args.args[1], False)
+
+    def test_capture_failure_is_visible_and_not_claimed_as_enabled(self):
+        with patch("app.ui.main_window.set_capture_exclusion", return_value=CaptureProtectionResult(False, False, "Denied")):
+            self.window.capture_exclusion_checkbox.setChecked(True)
+        self.assertFalse(self.window.capture_exclusion_checkbox.isChecked())
+        self.assertEqual(self.window.capture_exclusion_status.text(), "Denied")
+
+    def test_capture_exclusion_can_be_reapplied_after_native_window_change(self):
+        with patch("app.ui.main_window.set_capture_exclusion", return_value=CaptureProtectionResult(True, True, "Accepted")) as native:
+            self.window.capture_exclusion_checkbox.setChecked(True)
+            self.window._reapply_capture_exclusion()
+            self.assertGreaterEqual(native.call_count, 2)
+            self.assertTrue(self.window.capture_exclusion_checkbox.isChecked())
 
     def test_ai_updates_card_without_duplicate_or_reverting_current_phrase(self):
         first = PhraseResult("Why?", "Почему?", None, 1)

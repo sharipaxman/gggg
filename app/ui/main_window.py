@@ -13,7 +13,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QObject, Signal, QSize
+from PySide6.QtCore import Qt, QObject, Signal, QSize, QEvent, QTimer
 from PySide6.QtGui import QClipboard, QPixmap, QIcon
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.pipeline import LessonPipeline, PhraseResult
+from app.window_privacy import capture_protection_support, set_capture_exclusion
 from app.assistant import Assistance, VARIANT_LABELS, parse_variants
 from app.assistant_workspace import PROMPT_MAX_CHARS, QUESTION_MAX_CHARS, MEMORY_LIMIT, CONTEXT_CHAR_BUDGET
 from app.hotkey_manager import HotkeyManager
@@ -194,6 +195,8 @@ class MainWindow(QMainWindow):
         self.bridge.error_occurred.connect(self._on_error)
         self.bridge.chat_ready.connect(self._on_chat_ready)
 
+        self._capture_exclusion_requested = False
+        self._capture_reapply_pending = False
         self._current_entry_id = 0
         self._last_chat_answer = ""
         self._last_chat_translation = ""
@@ -247,6 +250,25 @@ class MainWindow(QMainWindow):
         )
         self.assistant_checkbox.toggled.connect(self.pipeline.set_assistant_enabled)
         left_layout.addWidget(self.assistant_checkbox)
+
+        self.capture_exclusion_checkbox = QCheckBox("Исключить основное окно из захвата экрана (Windows)")
+        self.capture_exclusion_checkbox.setStyleSheet("color: #d1e8db;")
+        supported, support_message = capture_protection_support()
+        self.capture_exclusion_checkbox.setEnabled(supported)
+        self.capture_exclusion_checkbox.setToolTip(
+            "Вы продолжите видеть окно локально. Результат зависит от Windows и программы захвата. "
+            "Отдельные диалоги и панель задач не скрываются. Сначала проверьте тестовую запись."
+        )
+        self.capture_exclusion_checkbox.toggled.connect(self._toggle_capture_exclusion)
+        left_layout.addWidget(self.capture_exclusion_checkbox)
+        self.capture_exclusion_status = QLabel(
+            "Исключение из захвата выключено. Перед демонстрацией включите режим и проверьте запись."
+            if supported else support_message
+        )
+        self.capture_exclusion_status.setTextFormat(Qt.PlainText)
+        self.capture_exclusion_status.setWordWrap(True)
+        self.capture_exclusion_status.setStyleSheet("color: #8a8d93; font-size: 11px;")
+        left_layout.addWidget(self.capture_exclusion_status)
 
         current_frame = QFrame()
         current_frame.setStyleSheet(
@@ -319,6 +341,42 @@ class MainWindow(QMainWindow):
         splitter.setSizes([480, 500])
 
         self.setStatusBar(QStatusBar())
+
+    def _toggle_capture_exclusion(self, enabled: bool):
+        self._capture_exclusion_requested = enabled
+        result = set_capture_exclusion(int(self.winId()), enabled)
+        # Если отключение не сработало, флажок отражает прочитанное состояние,
+        # а не желание пользователя. Неизвестное состояние явно помечено ошибкой.
+        self._capture_exclusion_requested = result.enabled is True
+        previous = self.capture_exclusion_checkbox.blockSignals(True)
+        self.capture_exclusion_checkbox.setChecked(result.enabled is True)
+        self.capture_exclusion_checkbox.blockSignals(previous)
+        self.capture_exclusion_status.setText(result.message)
+        self.capture_exclusion_status.setStyleSheet(
+            "color: #aab8cf; font-size: 11px;" if result.applied
+            else "color: #f2a93c; font-size: 11px;"
+        )
+
+    def _schedule_capture_reapply(self):
+        if getattr(self, "_capture_exclusion_requested", False) and not self._capture_reapply_pending:
+            self._capture_reapply_pending = True
+            QTimer.singleShot(0, self._reapply_capture_exclusion)
+
+    def _reapply_capture_exclusion(self):
+        self._capture_reapply_pending = False
+        if self._capture_exclusion_requested:
+            self._toggle_capture_exclusion(True)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._schedule_capture_reapply()
+
+    def event(self, event):
+        result = super().event(event)
+        # Qt может пересоздать HWND. Старое ограничение не переносится само.
+        if event.type() == QEvent.WinIdChange:
+            self._schedule_capture_reapply()
+        return result
 
     def _build_assistant_panel(self):
         panel = QWidget()
@@ -562,6 +620,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Перевод скопирован в буфер обмена", 2000)
 
     def closeEvent(self, event):
+        self._capture_exclusion_requested = False  # отменяем отложенное применение к закрытому окну
         try:
             self._save_preferences()
             self.pipeline.close()
