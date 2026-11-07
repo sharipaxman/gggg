@@ -19,16 +19,17 @@ from PySide6.QtGui import QClipboard, QPixmap, QIcon
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QFrame, QSizePolicy, QListWidget, QListWidgetItem, QSplitter,
-    QStatusBar, QApplication, QMessageBox, QCheckBox, QPlainTextEdit, QTabWidget,
+    QStatusBar, QApplication, QMessageBox, QCheckBox, QPlainTextEdit, QTabWidget, QDialog,
 )
 
 from app.pipeline import LessonPipeline, PhraseResult
+from app.ui.screenshot_dialog import RegionSelectionDialog, ScreenshotQuestionDialog
 from app.window_privacy import capture_protection_support, set_capture_exclusion
 from app.assistant import Assistance, VARIANT_LABELS, parse_variants
 from app.assistant_workspace import PROMPT_MAX_CHARS, QUESTION_MAX_CHARS, MEMORY_LIMIT, CONTEXT_CHAR_BUDGET
 from app.hotkey_manager import HotkeyManager
 from app.history_store import HistoryEntry
-from app.config import HOTKEY_ATTACH_SCREENSHOT, HOTKEY_TOGGLE_LISTEN, HISTORY_LIMIT, OLLAMA_MODEL, ASSISTANT_CONTEXT_ENTRIES
+from app.config import HOTKEY_ATTACH_SCREENSHOT, HOTKEY_TOGGLE_LISTEN, HOTKEY_ANALYZE_SCREENSHOT, HISTORY_LIMIT, OLLAMA_MODEL, ASSISTANT_CONTEXT_ENTRIES
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,8 @@ class PipelineBridge(QObject):
     chat_ready = Signal(object)
     preparation_progress = Signal(str)
     preparation_finished = Signal(bool, str)
+    analyze_screenshot_requested = Signal()
+    history_screenshot_requested = Signal()
 
 
 class SuggestionsWidget(QWidget):
@@ -202,6 +205,11 @@ class MainWindow(QMainWindow):
         self._preparing = False
         self._start_after_preparation = False
         self._closing = False
+        self._chat_busy = False
+        self._image_capture_active = False
+        self._active_image_dialog = None
+        self.bridge.analyze_screenshot_requested.connect(self._capture_image_question)
+        self.bridge.history_screenshot_requested.connect(self._capture_history_screenshot)
 
         self._capture_exclusion_requested = False
         self._capture_reapply_pending = False
@@ -213,6 +221,7 @@ class MainWindow(QMainWindow):
         self.hotkeys = HotkeyManager(
             on_screenshot=self._emit_screenshot_hotkey,
             on_toggle_listen=self._emit_toggle_hotkey,
+            on_analyze_screenshot=self.bridge.analyze_screenshot_requested.emit,
         )
 
         self._build_ui()
@@ -222,6 +231,7 @@ class MainWindow(QMainWindow):
             self.hotkeys.start()
         except Exception:
             logger.exception("Не удалось зарегистрировать глобальные хоткеи")
+            self.statusBar().showMessage("Не удалось зарегистрировать хоткеи. Используйте кнопки или смените сочетания в app/config.py.", 15000)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -261,7 +271,7 @@ class MainWindow(QMainWindow):
         self.assistant_checkbox.setStyleSheet("color: #d1e8db;")
         self.assistant_checkbox.setToolTip(
             "Нужны запущенная Ollama и загруженная модель. Промпт и ограниченный фрагмент памяти "
-            "передаются только локальной модели. Скриншоты не анализируются."
+            "передаются только локальной модели. Снимки анализируются отдельно, после подтверждения."
         )
         self.assistant_checkbox.toggled.connect(self.pipeline.set_assistant_enabled)
         left_layout.addWidget(self.assistant_checkbox)
@@ -272,7 +282,8 @@ class MainWindow(QMainWindow):
         self.capture_exclusion_checkbox.setEnabled(supported)
         self.capture_exclusion_checkbox.setToolTip(
             "Вы продолжите видеть окно локально. Результат зависит от Windows и программы захвата. "
-            "Отдельные диалоги и панель задач не скрываются. Сначала проверьте тестовую запись."
+            "Новые окна выбора и предпросмотра снимка защищаются отдельно. "
+            "Другие диалоги и панель задач не скрываются. Проверьте тестовую запись."
         )
         self.capture_exclusion_checkbox.toggled.connect(self._toggle_capture_exclusion)
         left_layout.addWidget(self.capture_exclusion_checkbox)
@@ -324,7 +335,8 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(current_scroll, stretch=1)
 
         hint = QLabel(
-            f"Хоткей скриншота: {HOTKEY_ATTACH_SCREENSHOT.upper()}  •  "
+            f"Снимок в ИИ: {HOTKEY_ANALYZE_SCREENSHOT.upper()}  •  "
+            f"Снимок в историю: {HOTKEY_ATTACH_SCREENSHOT.upper()}  •  "
             f"Старт/стоп прослушивания: {HOTKEY_TOGGLE_LISTEN.upper()}\n"
             "Перевод появляется только после того, как преподаватель закончил фразу (пауза в речи), "
             "а не по отдельным словам."
@@ -350,6 +362,7 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.history_scroll)
 
         right_tabs = QTabWidget()
+        self.right_tabs = right_tabs
         right_tabs.addTab(self._build_assistant_panel(), "Промпт и чат")
         right_tabs.addTab(right_panel, "История переводов")
         splitter.addWidget(right_tabs)
@@ -443,6 +456,13 @@ class MainWindow(QMainWindow):
         self.copy_chat_translation_btn.clicked.connect(lambda: QApplication.clipboard().setText(self._last_chat_translation))
         buttons.addWidget(self.copy_chat_translation_btn)
         layout.addLayout(buttons)
+        self.image_btn = QPushButton(f"Снимок + вопрос ИИ ({HOTKEY_ANALYZE_SCREENSHOT.upper()})")
+        self.image_btn.setToolTip(
+            "Выделите область на мониторе под курсором, проверьте её и добавьте текст. "
+            "Для задания в браузере удобнее хоткей. Отправка — только после подтверждения."
+        )
+        self.image_btn.clicked.connect(self._capture_image_question)
+        layout.addWidget(self.image_btn)
         self.chat_status = QLabel("Промпт и память сохраняются локально. Автоответ включается флажком слева.")
         self.chat_status.setTextFormat(Qt.PlainText)
         self.chat_status.setWordWrap(True)
@@ -472,6 +492,10 @@ class MainWindow(QMainWindow):
         blocks = []
         for event in events:
             variants = parse_variants(event.get("variants", []))
+            if event.get("image_path"):
+                blocks.append(f"Снимок: {Path(event['image_path']).name} (сохранён локально)")
+            if event.get("explanation_ru") and variants:
+                blocks.append("Разбор снимка:\n" + event["explanation_ru"])
             if event["role"] == "assistant" and variants:
                 blocks.append("ИИ • два варианта • A2")
                 for variant in variants:
@@ -495,9 +519,52 @@ class MainWindow(QMainWindow):
         bar.setValue(bar.maximum())
 
     def _set_chat_busy(self, busy: bool):
+        self._chat_busy = busy
+        self.image_btn.setEnabled(not busy)
         self.ask_btn.setEnabled(not busy)
         self.question_edit.setEnabled(not busy)
         self.clear_memory_btn.setEnabled(not busy)
+
+    def _exec_image_dialog(self, dialog):
+        self._active_image_dialog = dialog
+        try:
+            if self._capture_exclusion_requested:
+                result = set_capture_exclusion(int(dialog.winId()), True)
+                if not result.applied:
+                    raise RuntimeError("Не удалось защитить окно снимка от захвата: " + result.message)
+            return dialog.exec()
+        finally:
+            self._active_image_dialog = None
+            dialog.deleteLater()
+
+    def _capture_image_question(self):
+        # Hotkey приходит только через Qt-сигнал. Никаких stop()/start() аудио здесь.
+        if self._closing or self._image_capture_active:
+            return
+        if self._chat_busy:
+            self.chat_status.setText("Дождитесь ответа на предыдущий ручной запрос.")
+            return
+        self._image_capture_active = True
+        try:
+            selector = RegionSelectionDialog(self)
+            if self._exec_image_dialog(selector) != QDialog.Accepted or self._closing:
+                return
+            composer = ScreenshotQuestionDialog(selector.selected_image, self)
+            if self._exec_image_dialog(composer) != QDialog.Accepted or self._closing:
+                return
+            if not self._save_preferences():
+                return
+            self._set_chat_busy(True)
+            self.chat_status.setText("Разбираю снимок… ИИ-запросы идут по очереди; речь и перевод продолжаются.")
+            self.pipeline.chat.ask_image(composer.image_png, composer.question, self.bridge.chat_ready.emit)
+            self.right_tabs.setCurrentIndex(0)
+            self._load_chat()
+            self._refresh_memory()
+        except Exception as exc:
+            self._set_chat_busy(False)
+            self.chat_status.setText(f"Не удалось разобрать снимок: {exc}")
+        finally:
+            self._image_capture_active = False
 
     def _ask_question(self):
         if not self._save_preferences():
@@ -520,12 +587,13 @@ class MainWindow(QMainWindow):
         self.chat_status.setText(
             f"Ошибка: {result.error}" if result.error else
             (f"Ответ готов. Перевод недоступен: {result.translation_error}" if result.translation_error
-             else "Ответ и перевод готовы и сохранены в чате.")
+             else ("Разбор снимка готов и сохранён в чате." if result.explanation_ru and not result.variants
+                   else "Ответ и перевод готовы и сохранены в чате."))
         )
 
     def _clear_memory(self):
         if QMessageBox.question(self, "Очистить память?",
-                                "Удалить память ИИ и ручной чат? Промпт и история переводов останутся.") != QMessageBox.Yes:
+                                "Удалить память ИИ и ручной чат? Промпт, история переводов и файлы снимков останутся.") != QMessageBox.Yes:
             return
         self.pipeline.workspace.clear_memory()
         self._load_chat()
@@ -643,6 +711,11 @@ class MainWindow(QMainWindow):
     # Хоткеи (вызываются из потока библиотеки `keyboard` — пробрасываем в UI-поток через сигналы)
     # ------------------------------------------------------------------
     def _emit_screenshot_hotkey(self):
+        self.bridge.history_screenshot_requested.emit()
+
+    def _capture_history_screenshot(self):
+        if self._closing:
+            return
         try:
             self.pipeline.capture_screenshot_now()
             self.statusBar().showMessage("Снимок экрана сделан — будет прикреплён к следующей фразе", 4000)
@@ -691,6 +764,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._closing = True
+        if self._active_image_dialog is not None:
+            self._active_image_dialog.reject()
         self._capture_exclusion_requested = False  # отменяем отложенное применение к закрытому окну
         try:
             self._save_preferences()

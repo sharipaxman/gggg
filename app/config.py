@@ -72,18 +72,21 @@ HISTORY_LIMIT = 50
 # ---------------------------------------------------------------------------
 HOTKEY_ATTACH_SCREENSHOT = "ctrl+shift+s"
 HOTKEY_TOGGLE_LISTEN = "ctrl+shift+l"
+HOTKEY_ANALYZE_SCREENSHOT = "ctrl+alt+s"
 
 # ---------------------------------------------------------------------------
 # Локальный ИИ-помощник (Ollama). Включается отдельно в интерфейсе.
 # Разрешён только loopback: текст не должен незаметно уйти в облако.
 # ---------------------------------------------------------------------------
 OLLAMA_URL = os.environ.get("LESSON_OLLAMA_URL", "http://127.0.0.1:11434")
-OLLAMA_MODEL = os.environ.get("LESSON_OLLAMA_MODEL", "qwen2.5:3b")
-ASSISTANT_TIMEOUT_SECONDS = 30
+OLLAMA_MODEL = os.environ.get("LESSON_OLLAMA_MODEL", "qwen3-vl:4b")
+ASSISTANT_TIMEOUT_SECONDS = 60
+ASSISTANT_VISION_TIMEOUT_SECONDS = 180
 ASSISTANT_CONTEXT_ENTRIES = 4
 ASSISTANT_MAX_TEXT_CHARS = 800
 
-# Быстрые короткие подсказки; 7b можно выбрать через LESSON_OLLAMA_MODEL.
-ASSISTANT_NUM_CTX = 4096
+# Одна локальная VL-модель для текста и снимков. Общее окно не требует
+# смены размера KV-кеша между текстовым и визуальным запросами.
+ASSISTANT_NUM_CTX = 8192
 ASSISTANT_NUM_PREDICT = 384
 ASSISTANT_KEEP_ALIVE = "30m"  # не выгружать модель между репликами (занимает RAM/VRAM)

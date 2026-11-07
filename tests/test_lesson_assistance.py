@@ -283,6 +283,40 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(pipeline._worker_thread.is_alive())
         self.assertFalse(pipeline._assistant_thread.is_alive())
 
+    def test_image_request_does_not_block_audio_translation(self):
+        from app.assistant_workspace import ContextChat
+        from image_fixture import png_image
+        pipeline = self.pipeline
+        pipeline.capture, pipeline.segmenter = MagicMock(), MagicMock()
+        pipeline._running = False
+        pipeline._worker_thread = pipeline._assistant_thread = None
+        pipeline._work_queue = queue.Queue()
+        started, release, translated = threading.Event(), threading.Event(), threading.Event()
+        pipeline.chat = ContextChat(pipeline.assistant, pipeline.workspace, image_directory=Path(self.temp.name) / "shots")
+        pipeline.recognizer.recognize_pcm16.return_value = SimpleNamespace(text="New audio", language="en")
+        pipeline.translator.translate.return_value = "Новая речь"
+        pipeline.on_phrase = lambda result: translated.set()
+
+        def slow_image(*args):
+            started.set()
+            release.wait(timeout=3)
+            return AssistantReply("Разбор", language="ru", explanation_ru="Разбор")
+
+        pipeline.assistant.analyze_image.side_effect = slow_image
+        pipeline.start()
+        try:
+            pipeline.chat.ask_image(png_image(), "Разбери", lambda _: None)
+            self.assertTrue(started.wait(timeout=2))
+            pipeline._handle_utterance(self.utterance)
+            self.assertTrue(translated.wait(timeout=2), "Разбор картинки заблокировал перевод речи")
+            self.assertFalse(release.is_set())
+            pipeline.capture.stop.assert_not_called()
+        finally:
+            release.set()
+            pipeline.chat._thread.join(timeout=2)
+            pipeline.chat.close()
+            pipeline.stop()
+
     def test_preparation_finishes_before_audio_start(self):
         pipeline = self.pipeline
         pipeline._prepared = False

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, call
 from urllib.error import HTTPError, URLError
 
 from app.assistant import Assistance, AnswerSuggestion, ConversationAssistant, is_explicit_reply_request, RESPONSE_SCHEMA, AssistantReply, resolve_task, ReplyVariant, parse_variants, learner_name_fact, task_with_profile
-from app.config import ASSISTANT_CONTEXT_ENTRIES, ASSISTANT_MAX_TEXT_CHARS
+from app.config import ASSISTANT_CONTEXT_ENTRIES, ASSISTANT_MAX_TEXT_CHARS, ASSISTANT_NUM_CTX, ASSISTANT_TIMEOUT_SECONDS
 
 
 class AssistantTests(unittest.TestCase):
@@ -72,9 +72,9 @@ class AssistantTests(unittest.TestCase):
         self.assertNotIn("private translation", request.data.decode())
         self.assertNotIn("screenshot", request.data.decode())
         self.assertEqual(body["keep_alive"], "30m")
-        self.assertEqual(body["options"]["num_ctx"], 4096)
+        self.assertEqual(body["options"]["num_ctx"], ASSISTANT_NUM_CTX)
         self.assertEqual(body["options"]["num_predict"], 384)
-        self.assertEqual(self.client._opener.open.call_args.kwargs["timeout"], 30)
+        self.assertEqual(self.client._opener.open.call_args.kwargs["timeout"], ASSISTANT_TIMEOUT_SECONDS)
 
     def test_explicit_requests_without_question_mark(self):
         for text in ("Tell me the origin of your name.", "Please tell me about yourself.", "Okay. Tell me about your name.",

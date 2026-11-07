@@ -43,6 +43,86 @@ class MainWindowTests(unittest.TestCase):
         self.window = MainWindow()
         self.addCleanup(self.window.close)
 
+    def screenshot_dialogs(self, selected=True, confirmed=True):
+        selector, composer = MagicMock(), MagicMock()
+        selector.exec.return_value = 1 if selected else 0
+        composer.exec.return_value = 1 if confirmed else 0
+        composer.image_png = b"png"
+        composer.question = "Объясни упражнение 2"
+        return selector, composer
+
+    def test_confirmed_screenshot_and_comment_do_not_stop_listening(self):
+        self.pipeline.is_running = True
+        selector, composer = self.screenshot_dialogs()
+        with patch("app.ui.main_window.RegionSelectionDialog", return_value=selector), \
+                patch("app.ui.main_window.ScreenshotQuestionDialog", return_value=composer):
+            self.window._capture_image_question()
+        self.pipeline.chat.ask_image.assert_called_once()
+        self.assertEqual(self.pipeline.chat.ask_image.call_args.args[:2], (b"png", "Объясни упражнение 2"))
+        self.pipeline.stop.assert_not_called()
+        self.pipeline.start.assert_not_called()
+        self.assertTrue(self.window._chat_busy)
+        self.assertFalse(self.window.image_btn.isEnabled())
+        self.window._on_chat_ready(ChatResult("Q", answer="Объяснение", explanation_ru="Объяснение"))
+        self.assertTrue(self.window.image_btn.isEnabled())
+        self.assertIn("Разбор снимка готов", self.window.chat_status.text())
+
+    def test_cancelling_selection_or_preview_never_sends_image(self):
+        for selected, confirmed in ((False, False), (True, False)):
+            with self.subTest(selected=selected):
+                selector, composer = self.screenshot_dialogs(selected, confirmed)
+                with patch("app.ui.main_window.RegionSelectionDialog", return_value=selector), \
+                        patch("app.ui.main_window.ScreenshotQuestionDialog", return_value=composer):
+                    self.window._capture_image_question()
+                self.pipeline.chat.ask_image.assert_not_called()
+                self.assertFalse(self.window._image_capture_active)
+                self.assertFalse(self.window._chat_busy)
+
+    def test_busy_or_duplicate_hotkey_does_not_open_another_selector(self):
+        for flag in ("_chat_busy", "_image_capture_active"):
+            setattr(self.window, flag, True)
+            with patch("app.ui.main_window.RegionSelectionDialog") as selector:
+                self.window._capture_image_question()
+                selector.assert_not_called()
+            setattr(self.window, flag, False)
+
+    def test_image_dispatch_failure_restores_controls(self):
+        self.pipeline.chat.ask_image.side_effect = RuntimeError("Previous request is busy")
+        selector, composer = self.screenshot_dialogs()
+        with patch("app.ui.main_window.RegionSelectionDialog", return_value=selector), \
+                patch("app.ui.main_window.ScreenshotQuestionDialog", return_value=composer):
+            self.window._capture_image_question()
+        self.assertFalse(self.window._chat_busy)
+        self.assertTrue(self.window.image_btn.isEnabled())
+        self.assertIn("Previous request is busy", self.window.chat_status.text())
+
+    def test_privacy_failure_prevents_opening_screenshot_dialog(self):
+        self.window._capture_exclusion_requested = True
+        dialog = MagicMock()
+        dialog.winId.return_value = 42
+        failure = CaptureProtectionResult(False, False, "Denied")
+        with patch("app.ui.main_window.set_capture_exclusion", return_value=failure):
+            with self.assertRaisesRegex(RuntimeError, "Denied"):
+                self.window._exec_image_dialog(dialog)
+        dialog.exec.assert_not_called()
+        dialog.deleteLater.assert_called_once()
+
+    def test_image_explanation_is_visible_before_both_variants(self):
+        variants = [{"kind": "short", "text": "It is a cat.", "translation": "Это кот.",
+                     "language": "en", "target_language": "ru", "translation_error": ""},
+                    {"kind": "long", "text": "It is a cat. It is small.", "translation": "Это маленький кот.",
+                     "language": "en", "target_language": "ru", "translation_error": ""}]
+        self.pipeline.workspace.recent.return_value = [
+            {"role": "user", "text": "Опиши", "image_path": "/data/vision.png"},
+            {"role": "assistant", "text": "Combined", "explanation_ru": "Нужно описать животное.", "variants": variants},
+        ]
+        self.window._load_chat()
+        text = self.window.chat_view.toPlainText()
+        self.assertIn("vision.png", text)
+        self.assertIn("Нужно описать животное", text)
+        self.assertIn("It is a cat", text)
+        self.assertIn("Это кот", text)
+
     def test_first_listen_prepares_in_background_before_recording(self):
         with patch("app.ui.main_window.threading.Thread") as thread:
             self.window._toggle_listening()
