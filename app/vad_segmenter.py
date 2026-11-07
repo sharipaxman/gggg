@@ -35,6 +35,7 @@ VAD-сегментатор на Silero VAD: главная логика "дож�
 from __future__ import annotations
 
 import logging
+import math
 import queue
 import threading
 from dataclasses import dataclass
@@ -64,7 +65,7 @@ INT16_MAX = 32768.0
 SILERO_HUB_REPO = "snakers4/silero-vad"
 
 
-def load_silero_model(use_onnx: bool = VAD_USE_ONNX):
+def load_silero_model(use_onnx: bool = VAD_USE_ONNX, allow_download: bool = False):
     """Загружает модель Silero VAD.
 
     Порядок попыток (от самого "офлайнового" к самому "онлайновому"):
@@ -72,8 +73,8 @@ def load_silero_model(use_onnx: bool = VAD_USE_ONNX):
        интернет не нужен вообще;
     2. локальный кеш torch.hub в data/models/torch_hub — если модель уже
        скачивали раньше;
-    3. загрузка с GitHub через torch.hub (нужен интернет один раз,
-       дальше работает из кеша).
+    3. только при allow_download=True (scripts/setup_models.py):
+       загрузка с GitHub через torch.hub. Во время урока этот путь запрещён.
     """
     # Модель крошечная: несколько потоков только мешают и едят CPU.
     torch.set_num_threads(TORCH_NUM_THREADS)
@@ -90,19 +91,24 @@ def load_silero_model(use_onnx: bool = VAD_USE_ONNX):
     TORCH_HUB_DIR.mkdir(parents=True, exist_ok=True)
     torch.hub.set_dir(str(TORCH_HUB_DIR))
 
-    cached_repo = TORCH_HUB_DIR / "hub" / "snakers4_silero-vad_master"
-    if cached_repo.exists():
-        try:
-            model, _utils = torch.hub.load(
-                repo_or_dir=str(cached_repo),
-                model="silero_vad",
-                source="local",
-                onnx=use_onnx,
-            )
-            logger.info("Silero VAD загружен из локального кеша torch.hub: %s", cached_repo)
-            return model
-        except Exception as exc:
-            logger.warning("Локальный кеш torch.hub непригоден (%s), скачиваем модель заново.", exc)
+    # torch.hub кладёт репозиторий прямо в TORCH_HUB_DIR; поддерживаем и старый путь.
+    for cached_repo in (TORCH_HUB_DIR / "snakers4_silero-vad_master",
+                        TORCH_HUB_DIR / "hub" / "snakers4_silero-vad_master"):
+        if cached_repo.exists():
+            try:
+                model, _utils = torch.hub.load(
+                    repo_or_dir=str(cached_repo), model="silero_vad", source="local", onnx=use_onnx,
+                )
+                logger.info("Silero VAD загружен из локального кеша: %s", cached_repo)
+                return model
+            except Exception as exc:
+                logger.warning("Локальный кеш Silero непригоден: %s", exc)
+    if not allow_download:
+        raise RuntimeError(
+            "Локальная Silero VAD не найдена или не загрузилась. "
+            "Установите silero-vad и выполните python scripts/setup_models.py. "
+            "Загрузка с GitHub во время урока отключена."
+        )
 
     model, _utils = torch.hub.load(
         repo_or_dir=SILERO_HUB_REPO,
@@ -139,7 +145,8 @@ class VadSegmenter:
         self._frames_per_ms = SAMPLE_RATE / 1000
         # Silero принимает строго 512 сэмплов на 16 кГц (256 на 8 кГц)
         self._frame_samples = VAD_WINDOW_SAMPLES
-        self._silence_frames_needed = max(1, int(END_OF_SPEECH_SILENCE_MS / FRAME_MS))
+        # Округляем вверх: при 32 мс 1500 мс требуют 47 окон (=1504 мс), не 46.
+        self._silence_frames_needed = max(1, math.ceil(END_OF_SPEECH_SILENCE_MS / FRAME_MS))
         self._min_speech_frames = max(1, int(MIN_UTTERANCE_MS / FRAME_MS))
         self._max_speech_frames = max(1, int(MAX_UTTERANCE_MS / FRAME_MS))
         self._pre_pad_frames = max(0, int(PRE_SPEECH_PADDING_MS / FRAME_MS))
