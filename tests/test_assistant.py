@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 from urllib.error import HTTPError, URLError
 
-from app.assistant import Assistance, AnswerSuggestion, ConversationAssistant, is_explicit_reply_request, RESPONSE_SCHEMA, AssistantReply, resolve_task, ReplyVariant, parse_variants, learner_name_fact
+from app.assistant import Assistance, AnswerSuggestion, ConversationAssistant, is_explicit_reply_request, RESPONSE_SCHEMA, AssistantReply, resolve_task, ReplyVariant, parse_variants, learner_name_fact, task_with_profile
 from app.config import ASSISTANT_CONTEXT_ENTRIES, ASSISTANT_MAX_TEXT_CHARS
 
 
@@ -19,6 +19,39 @@ class AssistantTests(unittest.TestCase):
     def respond(self, content):
         response = self.client._opener.open.return_value.__enter__.return_value
         response.read.return_value = json.dumps({"message": {"content": content}}).encode()
+
+    def test_unknown_name_requests_clarification_instead_of_model_guess(self):
+        self.client._translator = MagicMock()
+        self.client._translator.translate.return_value = "Уточните имя."
+        context = [{"role": "assistant", "text": "My name is John. It comes from Cnut."}]
+        for question in ("Name the origin of your name.", "What does your name mean?",
+                         "Where does your name come from?",
+                         "Расскажи о происхождении своего имени.", "Что означает твое имя?"):
+            with self.subTest(question=question):
+                reply = self.client.reply(question, context, "Use A2 English")
+                self.assertEqual([v.kind for v in reply.variants], ["short", "long"])
+                self.assertTrue(all(v.translation for v in reply.variants))
+                self.assertIn("tell me your name", reply.variants[0].text)
+                self.assertNotIn("John", reply.text)
+        self.client._opener.open.assert_not_called()
+
+    def test_explicit_profile_name_and_latest_user_override(self):
+        context = [{"role": "assistant", "text": "My name is John."}]
+        task = task_with_profile("Tell me the origin of your name.", context,
+                                 "Use A2 English. Меня зовут Артур. Give two answers.", False)
+        self.assertEqual(task["learner_name"], "Артур")
+        task = task_with_profile("имя Иван", context, "Меня зовут Артур.", True)
+        self.assertEqual(task["learner_name"], "Иван")
+
+    def test_warm_up_uses_empty_local_request_without_generation_or_history(self):
+        self.client._opener.open.return_value.__enter__.return_value.read.return_value = b'{"done":true}'
+        self.client.warm_up()
+        request = self.client._opener.open.call_args.args[0]
+        body = json.loads(request.data)
+        self.assertEqual(request.full_url, "http://127.0.0.1:11434/api/chat")
+        self.assertEqual(body["messages"], [])
+        self.assertEqual(body["keep_alive"], "30m")
+        self.assertNotIn("format", body)
 
     def test_structured_local_request_and_bounded_context(self):
         self.respond(self.answer.to_json())

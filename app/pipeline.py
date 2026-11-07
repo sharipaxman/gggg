@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Callable, Optional, TYPE_CHECKING
@@ -56,7 +57,7 @@ class LessonPipeline:
         self.recognizer = SpeechRecognizer()
         self.translator = Translator()
         self.history = HistoryStore()
-        self.assistant = ConversationAssistant()
+        self.assistant = ConversationAssistant(translator=self.translator)
         self.workspace = AssistantWorkspace()
         self.chat = ContextChat(self.assistant, self.workspace)
         self._assistant_enabled = threading.Event()
@@ -70,6 +71,8 @@ class LessonPipeline:
         self._worker_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._running = False
+        self._prepared = False
+        self._prepare_lock = threading.Lock()
 
     def set_assistant_enabled(self, enabled: bool):
         if enabled:
@@ -81,11 +84,47 @@ class LessonPipeline:
     def is_running(self) -> bool:
         return self._running
 
+    @property
+    def is_prepared(self) -> bool:
+        return self._prepared
+
+    def prepare_models(self, on_progress: Optional[Callable[[str], None]] = None) -> str:
+        """Вызывать из фонового потока UI. Звук пока не захватывается.
+
+        Базовые модели обязательны. Недоступная Ollama не запрещает перевод;
+        предупреждение возвращается отдельно. Повторный вызов может прогреть ИИ,
+        включённый уже после подготовки переводчика.
+        """
+        def stage(label, action):
+            if on_progress:
+                on_progress(label)
+            started = time.monotonic()
+            action()
+            logger.info("Подготовка %s: %.2fs", label, time.monotonic() - started)
+
+        with self._prepare_lock:
+            if not self._prepared:
+                stage("Silero VAD", self.segmenter.ensure_model)
+                stage("Whisper", self.recognizer.warm_up)
+                stage("Переводчик EN ↔ RU", self.translator.warm_up)
+                self._prepared = True
+            warning = ""
+            if self._assistant_enabled.is_set():
+                try:
+                    stage("Локальная Ollama", self.assistant.warm_up)
+                except Exception as exc:
+                    logger.warning("Перевод готов, но прогрев ИИ не удался: %s", exc)
+                    warning = str(exc)
+            return warning
+
     def start(self):
         if self._running:
             return
         if any(thread and thread.is_alive() for thread in (self._worker_thread, self._assistant_thread)):
             raise RuntimeError("Предыдущая обработка ещё завершается. Повторите запуск через несколько секунд.")
+        # Защитный барьер для запусков вне UI: модели должны быть готовы до записи.
+        if not self._prepared:
+            self.prepare_models()
         self._stop_event.clear()
         try:
             self.capture.start()
@@ -133,15 +172,20 @@ class LessonPipeline:
 
     def _process_utterance(self, utterance: Utterance):
         try:
+            started = time.monotonic()
             recognition = self.recognizer.recognize_pcm16(utterance.pcm_int16, utterance.sample_rate)
             source_text = recognition.text
             if not source_text.strip():
                 logger.debug("Фраза распознана как пустая, пропускаем")
                 return
 
+            recognized_at = time.monotonic()
             source_language = recognition.language
             target = target_language(source_language)
             translated_text = self.translator.translate(source_text, source_language, target)
+            translated_at = time.monotonic()
+            logger.info("Обработка фразы: ASR=%.2fs перевод=%.2fs всего=%.2fs (без очереди/ИИ)",
+                        recognized_at - started, translated_at - recognized_at, translated_at - started)
             use_assistant = self._assistant_enabled.is_set()
             # Контекст до текущей фразы, в хронологическом порядке.
             context = list(reversed(self.history.get_recent(ASSISTANT_CONTEXT_ENTRIES))) if use_assistant else []

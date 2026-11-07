@@ -1,7 +1,7 @@
 """Проверка автоязыка Whisper без загрузки модели."""
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 try:
     import numpy as np
@@ -29,6 +29,37 @@ class SpeechRecognizerTests(unittest.TestCase):
                 self.assertIsNone(call.kwargs["language"])
                 self.assertEqual(call.kwargs["task"], "transcribe")
                 np.testing.assert_array_equal(call.args[0], np.array([0, .5, -.5], dtype=np.float32))
+
+    def test_model_resolution_is_local_only(self):
+        self.recognizer._model = None
+        module = SimpleNamespace(WhisperModel=MagicMock())
+        with patch.dict("sys.modules", {"faster_whisper": module}):
+            self.recognizer._ensure_model()
+            self.recognizer._ensure_model()
+        module.WhisperModel.assert_called_once()
+        self.assertIs(module.WhisperModel.call_args.kwargs["local_files_only"], True)
+
+    def test_missing_model_has_explicit_setup_error(self):
+        self.recognizer._model = None
+        module = SimpleNamespace(WhisperModel=MagicMock(side_effect=OSError("cache missing")))
+        with patch.dict("sys.modules", {"faster_whisper": module}):
+            with self.assertRaisesRegex(RuntimeError, "setup_models.py"):
+                self.recognizer._ensure_model()
+        self.assertIsNone(self.recognizer._model)
+
+    def test_warm_up_consumes_lazy_generator(self):
+        decoded = []
+
+        def segments():
+            decoded.append(True)
+            yield SimpleNamespace(text="unused")
+
+        self.recognizer._model.transcribe.return_value = segments(), SimpleNamespace(language="en")
+        self.recognizer.warm_up()
+        self.assertEqual(decoded, [True])
+        kwargs = self.recognizer._model.transcribe.call_args.kwargs
+        self.assertEqual(kwargs["task"], "transcribe")
+        self.assertEqual(kwargs["beam_size"], 5)
 
     def test_invalid_sample_rate_rejected(self):
         with self.assertRaises(ValueError):

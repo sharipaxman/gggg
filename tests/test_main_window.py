@@ -34,12 +34,48 @@ class MainWindowTests(unittest.TestCase):
         self.addCleanup(self.pipeline_patch.stop)
         self.addCleanup(self.hotkeys_patch.stop)
         self.pipeline = self.pipeline_factory.return_value
+        self.pipeline.is_running = False
+        self.pipeline.is_prepared = False
         self.pipeline.history.get_recent.return_value = []
         self.pipeline.workspace.preferences.return_value = AssistantPreferences()
         self.pipeline.workspace.snapshot.return_value = (0, [])
         self.pipeline.workspace.recent.return_value = []
         self.window = MainWindow()
         self.addCleanup(self.window.close)
+
+    def test_first_listen_prepares_in_background_before_recording(self):
+        with patch("app.ui.main_window.threading.Thread") as thread:
+            self.window._toggle_listening()
+            thread.assert_called_once()
+            thread.return_value.start.assert_called_once()
+        self.assertTrue(self.window._preparing)
+        self.assertFalse(self.window.toggle_btn.isEnabled())
+        self.assertIn("запись не идёт", self.window.status_label.text())
+        self.pipeline.start.assert_not_called()
+        self.pipeline.is_prepared = True
+        self.window._on_preparation_finished(True, "")
+        self.pipeline.start.assert_called_once()
+        self.assertFalse(self.window._preparing)
+
+    def test_preparation_failure_does_not_start_recording(self):
+        with patch("app.ui.main_window.threading.Thread"):
+            self.window._toggle_listening()
+        self.window._on_preparation_finished(False, "missing local model")
+        self.pipeline.start.assert_not_called()
+        self.assertTrue(self.window.prepare_btn.isEnabled())
+        self.assertIn("missing local model", self.window.statusBar().currentMessage())
+
+    def test_prepare_button_does_not_start_listening_and_close_cancels_auto_start(self):
+        with patch("app.ui.main_window.threading.Thread"):
+            self.window._begin_preparation(False)
+        self.window._on_preparation_finished(True, "Ollama unavailable")
+        self.pipeline.start.assert_not_called()
+        self.assertIn("Ollama unavailable", self.window.statusBar().currentMessage())
+        with patch("app.ui.main_window.threading.Thread"):
+            self.window._begin_preparation(True)
+        self.window.close()
+        self.window._on_preparation_finished(True, "")
+        self.pipeline.start.assert_not_called()
 
     def test_default_disabled_checkbox_controls_pipeline(self):
         self.assertFalse(self.window.assistant_checkbox.isChecked())

@@ -5,7 +5,13 @@
 Перед первым запуском выполните разовую настройку: python scripts/setup_models.py
 """
 import logging
+import os
 import sys
+
+# Только запуск приложения: скрипт setup_models.py остаётся отдельным онлайн-шагом.
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["ARGOS_MODEL_PROVIDER"] = "OPENNMT"
 
 from PySide6.QtWidgets import QApplication
 

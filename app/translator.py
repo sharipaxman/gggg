@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 
 from app.config import TRANSLATE_FROM, TRANSLATE_TO
+from app.local_stanza import configure_local_stanza
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +25,14 @@ class Translator:
     def _ensure_translation(self, source: str, target: str):
         key = (source, target)
         if key not in self._translations:
+            # Внешний settings.json Argos не должен незаметно выбрать облачный API.
+            os.environ["ARGOS_MODEL_PROVIDER"] = "OPENNMT"
+            import argostranslate.settings as argos_settings
             import argostranslate.translate as argos_translate
+            argos_settings.model_provider = argos_settings.ModelProvider.OPENNMT
+            configure_local_stanza(argos_translate)
+            # Argos сам выставляет INFO при импорте и пишет все тексты/токены.
+            logging.getLogger("argostranslate.utils").setLevel(logging.WARNING)
 
             languages = argos_translate.get_installed_languages()
             from_lang = next((lang for lang in languages if lang.code == source), None)
@@ -37,6 +46,11 @@ class Translator:
             self._translations[key] = translation
             logger.info("Переводчик Argos Translate (%s→%s) готов", source, target)
         return self._translations[key]
+
+    def warm_up(self):
+        """Первый реальный проход прогревает и lazy Stanza, и модели EN↔RU."""
+        self.translate("Hello.", "en", "ru")
+        self.translate("Привет.", "ru", "en")
 
     def translate(self, text: str, source: str = TRANSLATE_FROM, target: str = TRANSLATE_TO) -> str:
         if not text.strip():

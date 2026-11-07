@@ -32,7 +32,7 @@ def setup_silero_vad():
     from app.config import SAMPLE_RATE, VAD_WINDOW_SAMPLES
     from app.vad_segmenter import load_silero_model
 
-    model = load_silero_model()
+    model = load_silero_model(allow_download=True)
 
     # прогрев: один прогон тишины, чтобы убедиться, что модель реально работает
     silence = torch.zeros(VAD_WINDOW_SAMPLES, dtype=torch.float32)
@@ -57,6 +57,7 @@ def setup_whisper():
         device=WHISPER_DEVICE,
         compute_type=WHISPER_COMPUTE_TYPE,
         download_root=str(MODELS_DIR),
+        local_files_only=False,  # загрузка разрешена только на этапе настройки
     )
     logger.info("Модель Whisper готова (сохранена в %s)", MODELS_DIR)
 

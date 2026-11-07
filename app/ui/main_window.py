@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -39,6 +40,8 @@ class PipelineBridge(QObject):
     phrase_ready = Signal(object)   # PhraseResult
     error_occurred = Signal(str)
     chat_ready = Signal(object)
+    preparation_progress = Signal(str)
+    preparation_finished = Signal(bool, str)
 
 
 class SuggestionsWidget(QWidget):
@@ -194,6 +197,11 @@ class MainWindow(QMainWindow):
         self.bridge.phrase_ready.connect(self._on_phrase_ready)
         self.bridge.error_occurred.connect(self._on_error)
         self.bridge.chat_ready.connect(self._on_chat_ready)
+        self.bridge.preparation_progress.connect(self._on_preparation_progress)
+        self.bridge.preparation_finished.connect(self._on_preparation_finished)
+        self._preparing = False
+        self._start_after_preparation = False
+        self._closing = False
 
         self._capture_exclusion_requested = False
         self._capture_reapply_pending = False
@@ -241,6 +249,13 @@ class MainWindow(QMainWindow):
         self.toggle_btn.clicked.connect(self._toggle_listening)
         top_bar.addWidget(self.toggle_btn)
         left_layout.addLayout(top_bar)
+        self.prepare_btn = QPushButton("Подготовить модели до урока")
+        self.prepare_btn.setToolTip(
+            "Загружает и прогревает локальные модели в фоне, без записи. "
+            "Первый запуск может занять десятки секунд. Для прогрева Ollama сначала включите ИИ."
+        )
+        self.prepare_btn.clicked.connect(lambda: self._begin_preparation(False))
+        left_layout.addWidget(self.prepare_btn)
 
         self.assistant_checkbox = QCheckBox(f"ИИ-подсказки по контексту (Ollama: {OLLAMA_MODEL})")
         self.assistant_checkbox.setStyleSheet("color: #d1e8db;")
@@ -552,12 +567,66 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Управление прослушиванием
     # ------------------------------------------------------------------
+    def _begin_preparation(self, start_after: bool):
+        if self._preparing or self._closing or self.pipeline.is_running:
+            return
+        self._preparing = True
+        self._start_after_preparation = start_after
+        self.toggle_btn.setEnabled(False)
+        self.prepare_btn.setEnabled(False)
+        self.assistant_checkbox.setEnabled(False)
+        self.status_label.setText("Подготовка, запись не идёт…")
+
+        def progress(label):
+            if not self._closing:
+                self.bridge.preparation_progress.emit(label)
+
+        def prepare():
+            try:
+                warning = self.pipeline.prepare_models(on_progress=progress)
+            except Exception as exc:
+                logger.exception("Не удалось подготовить модели")
+                if not self._closing:
+                    self.bridge.preparation_finished.emit(False, str(exc))
+            else:
+                if not self._closing:
+                    self.bridge.preparation_finished.emit(True, warning)
+
+        threading.Thread(target=prepare, daemon=True).start()
+
+    def _on_preparation_progress(self, label: str):
+        if not self._closing:
+            self.statusBar().showMessage(f"Подготовка: {label}. Запись ещё не началась.")
+
+    def _on_preparation_finished(self, ready: bool, message: str):
+        if self._closing:
+            return
+        self._preparing = False
+        self.assistant_checkbox.setEnabled(True)
+        start_after = self._start_after_preparation
+        self._start_after_preparation = False
+        self.toggle_btn.setEnabled(True)
+        self.prepare_btn.setEnabled(True)
+        self.status_label.setText("Модели готовы" if ready else "Ошибка подготовки")
+        self.statusBar().showMessage(message or "Локальные модели готовы. Можно начать урок.", 20000)
+        if ready and start_after:
+            self._toggle_listening()
+            # _toggle_listening не должен скрыть предупреждение о недоступной Ollama.
+            if message:
+                self.statusBar().showMessage(message, 20000)
+
     def _toggle_listening(self):
+        if self._preparing or self._closing:
+            return
+        if not self.pipeline.is_running and not self.pipeline.is_prepared:
+            self._begin_preparation(True)
+            return
         if self.pipeline.is_running:
             self.pipeline.stop()
             self.status_label.setText("Остановлено")
             self.status_label.setStyleSheet("color: #f2a93c; font-weight: 600; font-size: 14px;")
             self.toggle_btn.setText("▶ Начать слушать")
+            self.prepare_btn.setEnabled(True)
         else:
             try:
                 self.pipeline.start()
@@ -568,6 +637,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Слушаю системный звук...")
             self.status_label.setStyleSheet("color: #4caf7d; font-weight: 600; font-size: 14px;")
             self.toggle_btn.setText("⏸ Остановить")
+            self.prepare_btn.setEnabled(False)
 
     # ------------------------------------------------------------------
     # Хоткеи (вызываются из потока библиотеки `keyboard` — пробрасываем в UI-поток через сигналы)
@@ -620,6 +690,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Перевод скопирован в буфер обмена", 2000)
 
     def closeEvent(self, event):
+        self._closing = True
         self._capture_exclusion_requested = False  # отменяем отложенное применение к закрытому окну
         try:
             self._save_preferences()

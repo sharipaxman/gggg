@@ -100,6 +100,8 @@ class PipelineTests(unittest.TestCase):
         self.pipeline._assistant_enabled = threading.Event()
         self.pipeline._assistant_queue = queue.Queue(maxsize=1)
         self.pipeline._stop_event = threading.Event()
+        self.pipeline._prepared = True
+        self.pipeline._prepare_lock = threading.Lock()
         self.results = []
         self.pipeline.on_phrase = self.results.append
         self.pipeline.on_error = MagicMock()
@@ -280,6 +282,66 @@ class PipelineTests(unittest.TestCase):
             pipeline.stop()
         self.assertFalse(pipeline._worker_thread.is_alive())
         self.assertFalse(pipeline._assistant_thread.is_alive())
+
+    def test_preparation_finishes_before_audio_start(self):
+        pipeline = self.pipeline
+        pipeline._prepared = False
+        pipeline._running = False
+        pipeline._worker_thread = pipeline._assistant_thread = None
+        pipeline._work_queue = queue.Queue()
+        pipeline.capture, pipeline.segmenter = MagicMock(), MagicMock()
+        order = []
+        pipeline.segmenter.ensure_model.side_effect = lambda: order.append("vad")
+        pipeline.recognizer.warm_up.side_effect = lambda: order.append("asr")
+        pipeline.translator.warm_up.side_effect = lambda: order.append("translate")
+        pipeline.assistant.warm_up.side_effect = lambda: order.append("ai")
+        pipeline.capture.start.side_effect = lambda: order.append("audio")
+        pipeline.set_assistant_enabled(True)
+        pipeline.start()
+        try:
+            self.assertEqual(order, ["vad", "asr", "translate", "ai", "audio"])
+            self.assertTrue(pipeline.is_prepared)
+        finally:
+            pipeline.stop()
+
+    def test_failed_preparation_does_not_start_audio(self):
+        pipeline = self.pipeline
+        pipeline._prepared = False
+        pipeline._running = False
+        pipeline._worker_thread = pipeline._assistant_thread = None
+        pipeline.capture, pipeline.segmenter = MagicMock(), MagicMock()
+        pipeline.recognizer.warm_up.side_effect = RuntimeError("local model missing")
+        with self.assertRaisesRegex(RuntimeError, "local model missing"):
+            pipeline.start()
+        self.assertFalse(pipeline.is_prepared)
+        pipeline.capture.start.assert_not_called()
+        pipeline.segmenter.start.assert_not_called()
+
+    def test_prepare_once_and_ai_failure_keeps_translation_available(self):
+        pipeline = self.pipeline
+        pipeline._prepared = False
+        pipeline.segmenter = MagicMock()
+        pipeline.set_assistant_enabled(True)
+        pipeline.assistant.warm_up.side_effect = RuntimeError("Ollama unavailable")
+        progress = []
+        with self.assertLogs("app.pipeline", level="WARNING"):
+            warning = pipeline.prepare_models(progress.append)
+            pipeline.prepare_models()
+        self.assertEqual(warning, "Ollama unavailable")
+        self.assertTrue(pipeline.is_prepared)
+        self.assertEqual(progress, ["Silero VAD", "Whisper", "Переводчик EN ↔ RU", "Локальная Ollama"])
+        pipeline.recognizer.warm_up.assert_called_once()
+        pipeline.translator.warm_up.assert_called_once()
+        self.assertEqual(pipeline.assistant.warm_up.call_count, 2)
+        self.assertEqual(self.results, [])  # прогрев не создаёт карточек/истории
+
+    def test_processing_logs_stage_times_without_transcript(self):
+        with self.assertLogs("app.pipeline", level="INFO") as logs:
+            self.recognize(text="Private lesson phrase")
+        joined = "\n".join(logs.output)
+        self.assertIn("ASR=", joined)
+        self.assertIn("перевод=", joined)
+        self.assertNotIn("Private lesson phrase", joined)
 
     def test_unsupported_language_is_reported(self):
         with self.assertLogs("app.pipeline", level="ERROR"):
